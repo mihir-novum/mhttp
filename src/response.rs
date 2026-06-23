@@ -1,11 +1,12 @@
 use crate::CookieOptions;
 use crate::body::Body;
+use crate::compress::Compress;
 use crate::cookie_store::CookieStore;
 use crate::field_lines::FieldLines;
 use crate::transport::Transport;
 use bytes::{Bytes, BytesMut};
 use std::sync::Arc;
-use tokio::io::{AsyncWriteExt};
+use tokio::io::{AsyncWriteExt, BufReader};
 use uuid::Uuid;
 
 const RESERVED_HEADERS: &[&str] = &[
@@ -20,6 +21,7 @@ const RESERVED_HEADERS: &[&str] = &[
     "access-control-expose-headers",
     "cookie",
     "set-cookie",
+    "accept-encoding",
 ];
 
 #[derive(Debug, Clone)]
@@ -258,6 +260,61 @@ impl HttpResponse<HttpResponseBodyUnInitialized> {
         }
     }
 }
+
+impl HttpResponse<HttpResponseBodyInitialized> {
+    pub async fn compress(mut self) -> Self {
+        let Some(body) = &self.body else {
+            return self;
+        };
+        let body_bytes = body.to_bytes();
+
+        // Don't compress small responses — overhead not worth it
+        if body_bytes.len() < 1024 {
+            return self;
+        }
+
+        // Don't compress already-compressed content types
+        let content_type = self
+            .field_lines
+            .get("content-type")
+            .unwrap_or_default()
+            .to_owned();
+
+        if !Compress::is_compressible(&content_type) {
+            return self;
+        }
+
+        let Some(ae) = self.field_lines.get("accept-encoding") else {
+            return self;
+        };
+
+        let (compressed, encoding) = if ae.contains("zstd") {
+            let compressed = Compress::with_zstd(&body_bytes).await;
+            (compressed, "zstd")
+        } else if ae.contains("br") {
+            let compressed = Compress::with_brotli(&body_bytes).await;
+            (compressed, "br")
+        } else if ae.contains("gzip") {
+            let compressed = Compress::with_gzip(&body_bytes).await;
+            (compressed, "gzip")
+        } else {
+            return self;
+        };
+
+        // Only use compressed version if it's actually smaller
+        if compressed.len() >= body_bytes.len() {
+            return self;
+        }
+
+        self.field_lines.set("content-encoding", encoding);
+        self.field_lines
+            .set("content-length", compressed.len().to_string());
+        self.field_lines.set("vary", "Accept-Encoding");
+        self.body = Some(Body::from(&Bytes::from(compressed), Some(content_type)));
+        self
+    }
+}
+
 impl<State> HttpResponse<State> {
     pub async fn fallible_send(mut self) -> Result<(), tokio::io::Error> {
         let status_code = self.status_code;
@@ -298,5 +355,50 @@ impl<State> HttpResponse<State> {
 
     pub async fn send(self) {
         let _ = self.fallible_send().await;
+    }
+
+    pub async fn send_stream<R>(mut self, reader: R) -> Result<(), tokio::io::Error>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        let status_code = self.status_code.clone();
+        let status_bytes = self.status_code.to_bytes();
+
+        // Write status line
+        let mut response_line =
+            BytesMut::with_capacity(self.http_version.len() + status_bytes.len() + 6);
+        response_line.extend_from_slice(&self.http_version);
+        response_line.extend_from_slice(b" ");
+        response_line.extend_from_slice(&status_bytes);
+        response_line.extend_from_slice(b"\r\n");
+        self.stream.write_all(response_line.as_ref()).await?;
+
+        // Write headers
+        self.stream.write_all(&self.field_lines.to_bytes()).await?;
+
+        // Write cookies
+        if let Some(cookie_store) = &self.cookies {
+            let cookie_bytes = cookie_store.to_bytes();
+            if !cookie_bytes.is_empty() {
+                self.stream.write_all(&cookie_bytes).await?;
+            }
+        }
+
+        // End of headers
+        self.stream.write_all(b"\r\n").await?;
+
+        // Stream body in chunks — default buf size is 8KB, plenty for most files
+        // For large files this keeps memory usage flat regardless of file size
+        let mut buffered = BufReader::with_capacity(64 * 1024, reader);
+        tokio::io::copy(&mut buffered, &mut self.stream).await?;
+        tokio::io::copy(&mut buffered, &mut self.stream).await?;
+
+        self.stream.shutdown().await?;
+
+        if let Some(hook) = self.on_sent.take() {
+            hook(status_code);
+        }
+
+        Ok(())
     }
 }

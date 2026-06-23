@@ -10,6 +10,7 @@ mod server;
 mod tls;
 mod transport;
 pub mod static_files;
+mod compress;
 
 pub use request::HttpMethod;
 pub use response::HttpStatusCode;

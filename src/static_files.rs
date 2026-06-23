@@ -85,7 +85,9 @@ async fn serve_index(call: &mut HttpCall, base: &Path, index: Option<&'static st
 }
 
 async fn serve_file(call: &mut HttpCall, path: &Path) {
-    let mut file = match tokio::fs::File::open(path).await {
+    let mime = mime_from_path(path);
+
+    let file = match tokio::fs::File::open(path).await {
         Ok(f) => f,
         Err(_) => {
             call.response()
@@ -96,22 +98,30 @@ async fn serve_file(call: &mut HttpCall, path: &Path) {
         }
     };
 
-    let mut contents = Vec::new();
-    if file.read_to_end(&mut contents).await.is_err() {
-        call.response()
-            .status_code(HttpStatusCode::InternalServerError)
-            .send()
-            .await;
-        return;
-    }
+    // Stat the file to get content-length without reading it
+    let metadata = match file.metadata().await {
+        Ok(m) => m,
+        Err(_) => {
+            call.response()
+                .status_code(HttpStatusCode::InternalServerError)
+                .send()
+                .await;
+            return;
+        }
+    };
 
-    let mime = mime_from_path(path);
+    let file_size = metadata.len();
 
-    call.response()
+    // Take the response and write headers manually, then stream body
+    let resp = call
+        .response()
         .status_code(HttpStatusCode::Ok)
-        .bytes(contents, mime)
-        .send()
-        .await;
+        .__add_header_internal("content-type", mime)
+        .__add_header_internal("content-length", file_size.to_string());
+
+    if let Err(e) = resp.send_stream(file).await {
+        println!("Failed to stream file {:?}: {}", path, e);
+    }
 }
 
 fn mime_from_path(path: &Path) -> &'static str {
