@@ -1,0 +1,103 @@
+let http_server = match HttpServer::new(
+        8081,
+        Some(cors.clone())
+    )
+    .await
+    {
+        Ok(server) => server,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+    }
+    .on_request_complete(|info| async move {
+        let code: u16 = info.response_status().map_or(0, |status| status.into());
+        let id = info.id().to_string();
+
+        if (400..600).contains(&code) {
+            error!(
+                error = format!("Request {id} Served."),
+                request_id = id,
+                method = format!("{:#?}", info.method()),
+                route = info.route(),
+                response_code = code,
+                started_at = info.started_at().to_rfc3339(),
+                ended_at = if let Some(ended_at) = info.ended_at() {
+                    ended_at.to_rfc3339()
+                } else {
+                    "N/A".to_string()
+                },
+            );
+        } else {
+            info!(
+                message = format!("Request {id} Served."),
+                request_id = id,
+                method = format!("{:#?}", info.method()),
+                route = info.route(),
+                response_code = code,
+                started_at = info.started_at().to_rfc3339(),
+                ended_at = if let Some(ended_at) = info.ended_at() {
+                    ended_at.to_rfc3339()
+                } else {
+                    "N/A".to_string()
+                },
+            );
+        }
+    });
+
+    let https_server = match HttpServer::new_tls(
+        Config::server_port(),
+        Some(cors),
+        TlsConfig::FromFiles {
+            cert_path: "./localhost+1.pem".into(),
+            key_path:  "./localhost+1-key.pem".into(),
+        },
+    )
+        .await
+    {
+        Ok(server) => server,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+    }
+        .on_request_complete(|info| async move {
+            let code: u16 = info.response_status().map_or(0, |status| status.into());
+            let id = info.id().to_string();
+
+            if (400..600).contains(&code) {
+                error!(
+                error = format!("Request {id} Served."),
+                request_id = id,
+                method = format!("{:#?}", info.method()),
+                route = info.route(),
+                response_code = code,
+                started_at = info.started_at().to_rfc3339(),
+                ended_at = if let Some(ended_at) = info.ended_at() {
+                    ended_at.to_rfc3339()
+                } else {
+                    "N/A".to_string()
+                },
+            );
+            } else {
+                info!(
+                message = format!("Request {id} Served."),
+                request_id = id,
+                method = format!("{:#?}", info.method()),
+                route = info.route(),
+                response_code = code,
+                started_at = info.started_at().to_rfc3339(),
+                ended_at = if let Some(ended_at) = info.ended_at() {
+                    ended_at.to_rfc3339()
+                } else {
+                    "N/A".to_string()
+                },
+            );
+            }
+        });
+
+    if Config::development_mode() {
+        println!("\x1b[33m[ WARNING ] Server Running in Development Mode.\x1b[0m");
+    }
+
+    tokio::join!(http_server.listen(), https_server.listen());
