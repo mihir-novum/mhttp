@@ -113,7 +113,7 @@ async fn serve_file(call: &mut HttpCall, path: &Path) {
     call.response()
         .stream(file, metadata.len(), mime)
         .send()
-        .await
+        .await;
 }
 
 fn mime_from_path(path: &Path) -> &'static str {

@@ -23,6 +23,8 @@ const RESERVED_HEADERS: &[&str] = &[
     "set-cookie",
     "accept-encoding",
     "date",
+    "connection",
+    "keep-alive",
 ];
 
 #[derive(Debug, Clone)]
@@ -98,6 +100,7 @@ pub struct HttpResponse<State> {
     cookies: Option<CookieStore>,
     suppress_body: bool,
     on_sent: Option<ResponseHook>,
+    transport_slot: Arc<tokio::sync::Mutex<Option<Transport>>>,
     _state: std::marker::PhantomData<State>,
 }
 
@@ -107,6 +110,7 @@ impl HttpResponse<HttpResponseBodyUnInitialized> {
         http_version: B,
         request_id: Uuid,
         path: Arc<str>,
+        transport_slot: Arc<tokio::sync::Mutex<Option<Transport>>>,
     ) -> Self
     where
         B: Into<Bytes>,
@@ -124,6 +128,7 @@ impl HttpResponse<HttpResponseBodyUnInitialized> {
             cookies: None,
             suppress_body: false,
             on_sent: None,
+            transport_slot,
             _state: std::marker::PhantomData,
         }
     }
@@ -233,6 +238,7 @@ impl HttpResponse<HttpResponseBodyUnInitialized> {
             suppress_body: self.suppress_body,
             body: Some(Body::from(&json_bytes, Some("application/json".to_owned()))),
             on_sent: self.on_sent,
+            transport_slot: self.transport_slot,
             _state: std::marker::PhantomData,
         }
     }
@@ -264,6 +270,7 @@ impl HttpResponse<HttpResponseBodyUnInitialized> {
             suppress_body: self.suppress_body,
             body: Some(Body::from(&bytes, Some(content_type))),
             on_sent: self.on_sent,
+            transport_slot: self.transport_slot,
             _state: std::marker::PhantomData,
         }
     }
@@ -275,7 +282,7 @@ impl HttpResponse<HttpResponseBodyUnInitialized> {
         content_type: C,
     ) -> HttpResponse<HttpResponseBodyInitialized>
     where
-        R: AsyncRead + Unpin + Send + 'static,
+        R: AsyncRead + Unpin + Send + Sync + 'static,
         C: Into<String>,
     {
         let content_type = content_type.into();
@@ -293,6 +300,7 @@ impl HttpResponse<HttpResponseBodyUnInitialized> {
             suppress_body: self.suppress_body,
             body: Some(Body::from_stream(reader, content_len, Some(content_type))),
             on_sent: self.on_sent,
+            transport_slot: self.transport_slot,
             _state: std::marker::PhantomData,
         }
     }
@@ -382,7 +390,7 @@ impl HttpResponse<HttpResponseBodyInitialized> {
                 self.field_lines.set("content-encoding", encoding);
                 self.field_lines.set("vary", "Accept-Encoding");
 
-                let compressed_reader: Box<dyn AsyncRead + Unpin + Send> = match encoding {
+                let compressed_reader: Box<dyn AsyncRead + Unpin + Send + Sync> = match encoding {
                     "zstd" => Box::new(async_compression::tokio::bufread::ZstdEncoder::new(
                         BufReader::with_capacity(64 * 1024, reader),
                     )),
@@ -419,6 +427,10 @@ impl<State> HttpResponse<State> {
                 .format("%a, %d %b %Y %H:%M:%S GMT")
                 .to_string(),
         );
+
+        if self.body.is_none() && self.field_lines.get("content-length").is_none() {
+            self.field_lines.set("content-length", "0");
+        }
 
         let status_code = self.status_code;
         let status_code_copy = status_code.clone();
@@ -496,16 +508,17 @@ impl<State> HttpResponse<State> {
             }
         }
 
-        self.stream.shutdown().await?;
-
         if let Some(hook) = self.on_sent.take() {
             hook(status_code_copy);
         }
+
+        self.stream.flush().await?;
+        *self.transport_slot.lock().await = Some(self.stream);
 
         Ok(())
     }
 
     pub async fn send(self) {
-        let _ = self.fallible_send().await;
+        _ = self.fallible_send().await;
     }
 }

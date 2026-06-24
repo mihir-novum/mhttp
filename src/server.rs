@@ -13,8 +13,8 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
-use telemetry::{__InstrumentTrait, TelemetryContext};
-use tokio::io::{AsyncRead, AsyncWrite, BufReader};
+use telemetry::{__InstrumentTrait, TelemetryContext, warn};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
@@ -35,6 +35,7 @@ pub struct HttpCall {
     response: Option<HttpResponse<HttpResponseBodyUnInitialized>>,
     extras: HashMap<String, String>,
     request_id: Uuid,
+    transport_slot: Arc<tokio::sync::Mutex<Option<Transport>>>,
 }
 
 impl HttpCall {
@@ -43,6 +44,9 @@ impl HttpCall {
         request_id: Uuid,
         max_body_size: usize,
     ) -> Result<Self, (Transport, HttpRequestError)> {
+        let transport_slot: Arc<tokio::sync::Mutex<Option<Transport>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+
         let mut reader = BufReader::new(stream);
         let request = match HttpRequest::parse(&mut reader, max_body_size).await {
             Ok(request) => request,
@@ -57,11 +61,17 @@ impl HttpCall {
                 http_version,
                 request_id,
                 Arc::from(request.route()),
+                transport_slot.clone(),
             )),
             request,
             extras: HashMap::new(),
             request_id,
+            transport_slot,
         })
+    }
+
+    pub(crate) async fn take_transport(&self) -> Option<Transport> {
+        self.transport_slot.lock().await.take()
     }
 
     pub(crate) fn method(&self) -> &HttpMethod {
@@ -218,6 +228,7 @@ pub struct HttpServer {
     cors: Option<Cors>,
     tls: Option<TlsAcceptor>,
     request_timeout: std::time::Duration,
+    keep_alive_timeout: std::time::Duration,
     max_body_size: usize,
 }
 
@@ -238,6 +249,7 @@ impl HttpServer {
             cors,
             tls: None,
             request_timeout: std::time::Duration::from_secs(60),
+            keep_alive_timeout: std::time::Duration::from_secs(75),
             max_body_size: 10 * 1024 * 1024,
         })
     }
@@ -268,6 +280,11 @@ impl HttpServer {
         self
     }
 
+    pub fn keep_alive_timeout(mut self, duration: std::time::Duration) -> Self {
+        self.keep_alive_timeout = duration;
+        self
+    }
+
     pub fn max_body_size(mut self, bytes: usize) -> Self {
         self.max_body_size = bytes;
         self
@@ -295,38 +312,66 @@ impl HttpServer {
                 Ok((stream, _)) = server.listener.accept() => {
                     let server = server.clone();
                     let context = telemetry::create_context!("http.request");
-                    let request_id = Uuid::new_v4();
 
                     thread_pool.spawn(async move {
-                       TelemetryContext::add("request_id", Value::String(request_id.to_string()));
-
-                        match &server.tls {
+                        let transport = match &server.tls {
                             None => {
                                 let peer_addr = stream.peer_addr().unwrap();
-                                let transport = Transport::new(stream, peer_addr);
-                                server.handle_request(transport, request_id).await;
-                            },
+                                Transport::new(stream, peer_addr)
+                            }
                             Some(acceptor) => {
-                                match acceptor.accept(stream).await{
+                                match acceptor.accept(stream).await {
                                     Ok(tls_stream) => {
                                         let peer_addr = tls_stream.get_ref().0.peer_addr().unwrap();
-                                        let transport = Transport::new(tls_stream, peer_addr);
-                                        server.handle_request(transport, request_id).await;
-                                    },
+                                        Transport::new(tls_stream, peer_addr)
+                                    }
                                     Err(e) => {
-                                        println!("TLS error: {}", e);
+                                        warn!("TLS error: {}", e);
+                                        return;
                                     }
                                 }
                             }
-                        }
+                        };
 
+                        // One task per connection, many requests per connection
+                        server.handle_connection(transport).await;
                     }.instrument(context));
                 }
             }
         }
     }
 
-    async fn handle_request(&self, stream: Transport, request_id: Uuid) {
+    async fn handle_connection(&self, mut transport: Transport) {
+        loop {
+            let request_id = Uuid::new_v4();
+
+            match tokio::time::timeout(
+                self.keep_alive_timeout, // idle timeout between requests
+                self.handle_single_request(transport, request_id),
+            )
+            .await
+            {
+                Ok(Some(returned_transport)) => {
+                    // Client wants keep-alive — loop with same transport
+                    transport = returned_transport;
+                }
+                Ok(None) => {
+                    // Connection: close or error — done
+                    break;
+                }
+                Err(_) => {
+                    // Client idle too long — close silently
+                    break;
+                }
+            }
+        }
+    }
+
+    async fn handle_single_request(
+        &self,
+        stream: Transport,
+        request_id: Uuid,
+    ) -> Option<Transport> {
         let mut call: HttpCall = match tokio::time::timeout(
             self.request_timeout,
             HttpCall::parse(stream, request_id, self.max_body_size),
@@ -340,24 +385,58 @@ impl HttpServer {
                     _ => HttpStatusCode::BadRequest,
                 };
 
-                let _ = HttpResponse::new(
+                let slot = Arc::new(tokio::sync::Mutex::new(None));
+
+                HttpResponse::new(
                     stream,
                     Bytes::from_static(b"HTTP/1.1"),
                     request_id,
                     Arc::from(""),
+                    slot.clone(),
                 )
                 .status_code(status)
                 .send()
                 .await;
-                return;
+
+                if let Some(mut t) = slot.lock().await.take() {
+                    let _ = t.shutdown().await;
+                }
+
+                return None;
             }
-            Err(_) => return,
+            Err(_) => return None,
         };
+
+        let keep_alive = call
+            .header("connection")
+            .map(|v| !v.eq_ignore_ascii_case("close"))
+            .unwrap_or(true);
+
+        if let Some(resp) = call.response.take() {
+            let resp = resp.__add_header_internal(
+                "connection",
+                if keep_alive { "keep-alive" } else { "close" },
+            );
+            let resp = if keep_alive {
+                resp.__add_header_internal(
+                    "keep-alive",
+                    format!("timeout={}", self.keep_alive_timeout.as_secs()),
+                )
+            } else {
+                resp
+            };
+            call.response = Some(resp);
+        }
 
         if let Some(cors) = &self.cors {
             if *call.method() == HttpMethod::OPTIONS {
                 cors.handle_preflight(&mut call).await;
-                return;
+                // Get transport back from call after preflight response
+                return if keep_alive {
+                    call.take_transport().await
+                } else {
+                    None
+                };
             } else if let Some(resp) = call.response.take() {
                 let resp_with_cors = cors.add_cors_headers(&call, resp);
                 call.response = Some(resp_with_cors);
@@ -381,7 +460,6 @@ impl HttpServer {
                     info.set_response_status(status_code.clone());
                     info.mark_as_end();
                 });
-
                 if let Some(on_request_complete) = &on_complete
                     && let Some(info) = g.value()
                 {
@@ -393,12 +471,10 @@ impl HttpServer {
                     telemetry::spawn!(fut);
                 }
             });
-
-            call.response = Some(resp.set_on_set(hook))
+            call.response = Some(resp.set_on_set(hook));
         }
 
         let is_head = *call.method() == HttpMethod::HEAD;
-
         if is_head {
             if let Some(resp) = call.response.take() {
                 call.response = Some(resp.suppress_body());
@@ -416,7 +492,11 @@ impl HttpServer {
                     .status_code(HttpStatusCode::NotFound)
                     .send()
                     .await;
-                return;
+                return if keep_alive {
+                    call.take_transport().await
+                } else {
+                    None
+                };
             }
         };
 
@@ -425,13 +505,26 @@ impl HttpServer {
         if !route.middleware.is_empty() {
             for middleware in route.middleware.iter() {
                 middleware(&mut call).await;
-
                 if call.response_sent() {
-                    return;
+                    return if keep_alive {
+                        call.take_transport().await
+                    } else {
+                        None
+                    };
                 }
             }
         }
 
         (route.handler)(&mut call).await;
+
+        if keep_alive {
+            call.take_transport().await
+        } else {
+            // Explicitly shut down — client said Connection: close
+            if let Some(mut transport) = call.take_transport().await {
+                let _ = transport.shutdown().await;
+            }
+            None
+        }
     }
 }

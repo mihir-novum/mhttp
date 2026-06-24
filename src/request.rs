@@ -157,7 +157,7 @@ impl HttpRequest {
         max_body_size: usize,
     ) -> Result<Self, HttpRequestError>
     where
-        S: AsyncRead + AsyncWrite + Unpin + Send + PeerAddr + 'static,
+        S: AsyncRead + AsyncWrite + Unpin + Send + Sync + PeerAddr + 'static,
     {
         let peer_addr: SocketAddr = reader.get_ref().peer_addr().map_err(|e| {
             HttpRequestError::RequestParsingFailed(format!("Failed to get peer addr: {e}"))

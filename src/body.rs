@@ -244,7 +244,7 @@ pub enum Body {
         content_type: Option<String>,
     },
     Stream {
-        reader: Box<dyn AsyncRead + Unpin + Send>,
+        reader: Box<dyn AsyncRead + Unpin + Send + Sync>,
         content_length: u64,
         content_type: Option<String>,
     },
@@ -264,7 +264,7 @@ impl Body {
         content_type: Option<String>,
     ) -> Self
     where
-        R: AsyncRead + Unpin + Send + 'static,
+        R: AsyncRead + Unpin + Send + Sync + 'static,
     {
         Self::Stream {
             reader: Box::new(reader),

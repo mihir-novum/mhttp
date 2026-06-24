@@ -8,13 +8,13 @@ pub struct Transport {
     peer_addr: SocketAddr,
 }
 
-trait DynStream: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
-impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> DynStream for S {}
+trait DynStream: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static {}
+impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static> DynStream for S {}
 
 impl Transport {
     pub fn new<S>(stream: S, peer_addr: SocketAddr) -> Self
     where
-        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
     {
         Self {
             stream: Box::new(stream),
