@@ -6,7 +6,7 @@ use crate::field_lines::FieldLines;
 use crate::transport::Transport;
 use bytes::{Bytes, BytesMut};
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use uuid::Uuid;
 
 const RESERVED_HEADERS: &[&str] = &[
@@ -291,59 +291,108 @@ impl HttpResponse<HttpResponseBodyUnInitialized> {
 
 impl HttpResponse<HttpResponseBodyInitialized> {
     pub async fn compress(mut self) -> Self {
-        let Some(body) = &self.body else {
+        let Some(body) = self.body.take() else {
             return self;
         };
 
-        if body.is_stream() {
-            return self;
-        }
-
-        let body_bytes = body.to_bytes();
-
-        // Don't compress small responses — overhead not worth it
-        if body_bytes.len() < 1024 {
-            return self;
-        }
-
-        // Don't compress already-compressed content types
         let content_type = self
             .field_lines
             .get("content-type")
             .unwrap_or_default()
             .to_owned();
 
-        if !Compress::is_compressible(&content_type) {
+        if Compress::is_compressible(&content_type) {
+            self.body = Some(body);
             return self;
         }
 
-        let Some(ae) = self.field_lines.get("accept-encoding") else {
+        let Some(encoding) = self
+            .field_lines
+            .get("accept-encoding")
+            .map(|v| v.to_owned())
+        else {
+            self.body = Some(body);
             return self;
         };
 
-        let (compressed, encoding) = if ae.contains("zstd") {
-            let compressed = Compress::with_zstd(&body_bytes).await;
-            (compressed, "zstd")
-        } else if ae.contains("br") {
-            let compressed = Compress::with_brotli(&body_bytes).await;
-            (compressed, "br")
-        } else if ae.contains("gzip") {
-            let compressed = Compress::with_gzip(&body_bytes).await;
-            (compressed, "gzip")
+        let encoding = if encoding.contains("zstd") {
+            "zstd"
+        } else if encoding.contains("gzip") {
+            "gzip"
+        } else if encoding.contains("br") {
+            "br"
         } else {
+            self.body = Some(body);
             return self;
         };
 
-        // Only use compressed version if it's actually smaller
-        if compressed.len() >= body_bytes.len() {
-            return self;
+        match body {
+            Body::Bytes {
+                bytes,
+                content_type: ct,
+            } => {
+                if bytes.len() < 1024 {
+                    self.body = Some(Body::Bytes {
+                        bytes,
+                        content_type: ct,
+                    });
+                    return self;
+                }
+
+                let compressed = match encoding {
+                    "zstd" => Compress::with_zstd(&bytes).await,
+                    "br" => Compress::with_brotli(&bytes).await,
+                    _ => Compress::with_gzip(&bytes).await,
+                };
+
+                if compressed.len() >= bytes.len() {
+                    self.body = Some(Body::Bytes {
+                        bytes,
+                        content_type: ct,
+                    });
+                    return self;
+                }
+
+                self.field_lines.set("content-encoding", encoding);
+                self.field_lines
+                    .set("content-length", compressed.len().to_string());
+                self.field_lines.set("vary", "Accept-Encoding");
+
+                self.body = Some(Body::Bytes {
+                    bytes: Bytes::from(compressed),
+                    content_type: ct,
+                });
+            }
+            Body::Stream {
+                reader,
+                content_type: ct,
+                ..
+            } => {
+                self.field_lines.remove("content-length");
+                self.field_lines.set("transfer-encoding", "chunked");
+                self.field_lines.set("content-encoding", encoding);
+                self.field_lines.set("vary", "Accept-Encoding");
+
+                let compressed_reader: Box<dyn AsyncRead + Unpin + Send> = match encoding {
+                    "zstd" => Box::new(async_compression::tokio::bufread::ZstdEncoder::new(
+                        BufReader::with_capacity(64 * 1024, reader),
+                    )),
+                    "br" => Box::new(async_compression::tokio::bufread::BrotliEncoder::new(
+                        BufReader::with_capacity(64 * 1024, reader),
+                    )),
+                    _ => Box::new(async_compression::tokio::bufread::GzipEncoder::new(
+                        BufReader::with_capacity(64 * 1024, reader),
+                    )),
+                };
+
+                self.body = Some(Body::Stream {
+                    reader: compressed_reader,
+                    content_length: 0,
+                    content_type: ct,
+                });
+            }
         }
 
-        self.field_lines.set("content-encoding", encoding);
-        self.field_lines
-            .set("content-length", compressed.len().to_string());
-        self.field_lines.set("vary", "Accept-Encoding");
-        self.body = Some(Body::from(&Bytes::from(compressed), Some(content_type)));
         self
     }
 }
@@ -375,11 +424,51 @@ impl<State> HttpResponse<State> {
 
         match self.body {
             Some(Body::Stream { reader, .. }) => {
+                let is_chunked = self
+                    .field_lines
+                    .get("transfer-encoding")
+                    .map(|v| v.contains("chunked"))
+                    .unwrap_or(false);
+
                 let mut buffered = BufReader::with_capacity(64 * 1024, reader);
-                tokio::io::copy(&mut buffered, &mut self.stream).await?;
+
+                if is_chunked {
+                    let mut buf = vec![0u8; 64 * 1024];
+                    loop {
+                        let n = buffered.read(&mut buf).await?;
+                        if n == 0 {
+                            break;
+                        }
+
+                        self.stream
+                            .write_all(format!("{:X}\r\n", n).as_bytes())
+                            .await?;
+                        self.stream.write_all(&buf[..n]).await?;
+                        self.stream.write_all(b"\r\n").await?;
+                    }
+
+                    self.stream.write_all(b"0\r\n\r\n").await?;
+                } else {
+                    tokio::io::copy(&mut buffered, &mut self.stream).await?;
+                }
             }
             Some(Body::Bytes { bytes, .. }) => {
-                self.stream.write_all(&bytes).await?;
+                let is_chunked = self
+                    .field_lines
+                    .get("transfer-encoding")
+                    .map(|v| v.contains("chunked"))
+                    .unwrap_or(false);
+
+                if is_chunked {
+                    self.stream
+                        .write_all(format!("{:X}\r\n", bytes.len()).as_bytes())
+                        .await?;
+                    self.stream.write_all(&bytes).await?;
+                    self.stream.write_all(b"\r\n").await?;
+                    self.stream.write_all(b"0\r\n\r\n").await?;
+                } else {
+                    self.stream.write_all(&bytes).await?;
+                }
             }
             None => {}
         }
