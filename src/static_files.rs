@@ -110,18 +110,10 @@ async fn serve_file(call: &mut HttpCall, path: &Path) {
         }
     };
 
-    let file_size = metadata.len();
-
-    // Take the response and write headers manually, then stream body
-    let resp = call
-        .response()
-        .status_code(HttpStatusCode::Ok)
-        .__add_header_internal("content-type", mime)
-        .__add_header_internal("content-length", file_size.to_string());
-
-    if let Err(e) = resp.send_stream(file).await {
-        println!("Failed to stream file {:?}: {}", path, e);
-    }
+    call.response()
+        .stream(file, metadata.len(), mime)
+        .send()
+        .await
 }
 
 fn mime_from_path(path: &Path) -> &'static str {

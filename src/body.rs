@@ -4,6 +4,7 @@ use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 use serde_json::Value;
 use std::collections::HashMap;
+use tokio::io::AsyncBufReadExt;
 
 #[derive(thiserror::Error, Debug)]
 pub enum MultipartError {
@@ -237,50 +238,93 @@ impl MultiPartField {
     }
 }
 
-pub struct Body {
-    bytes: Bytes,
-    content_type: Option<String>,
+pub enum Body {
+    Bytes {
+        bytes: Bytes,
+        content_type: Option<String>,
+    },
+    Stream {
+        reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+        content_length: u64,
+        content_type: Option<String>,
+    },
 }
 
 impl Body {
     pub(crate) fn from(bytes: &Bytes, content_type: Option<String>) -> Self {
-        Self {
+        Self::Bytes {
             bytes: bytes.clone(),
             content_type,
         }
     }
 
+    pub(crate) fn from_stream<R>(
+        reader: R,
+        content_length: u64,
+        content_type: Option<String>,
+    ) -> Self
+    where
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    {
+        Self::Stream {
+            reader: Box::new(reader),
+            content_length,
+            content_type,
+        }
+    }
+
     pub fn as_json(&self) -> Option<Value> {
-        match self.content_type {
-            Some(ref ct) if ct.starts_with("application/json") => {
-                serde_json::from_slice(&self.bytes[..]).ok()
-            }
-            _ => None,
+        match self {
+            Self::Bytes {
+                bytes,
+                content_type,
+            } => match content_type {
+                Some(ct) if ct.starts_with("application/json") => {
+                    serde_json::from_slice(&bytes[..]).ok()
+                }
+                _ => None,
+            },
+            Self::Stream { .. } => None,
         }
     }
 
     pub fn as_multipart(&self) -> Option<Multipart> {
-        match self.content_type {
-            Some(ref content_type) if content_type.starts_with("multipart/form-data") => {
-                let boundary = content_type
-                    .split(';')
-                    .find_map(|param| param.trim().strip_prefix("boundary="))
-                    .unwrap_or_default();
+        match self {
+            Self::Bytes {
+                bytes,
+                content_type,
+            } => match content_type {
+                Some(ct) if ct.starts_with("multipart/form-data") => {
+                    let boundary = ct
+                        .split(';')
+                        .find_map(|param| param.trim().strip_prefix("boundary="))
+                        .unwrap_or_default();
 
-                Multipart::parse(&self.bytes, boundary).ok()
-            }
-            _ => None,
+                    Multipart::parse(&bytes, boundary).ok()
+                }
+                _ => None,
+            },
+            Self::Stream { .. } => None,
         }
     }
 
     pub fn to_bytes(&self) -> Bytes {
-        self.bytes.clone()
+        match self {
+            Body::Bytes { bytes, .. } => bytes.clone(),
+            Body::Stream { .. } => {
+                panic!("cannot convert stream body to bytes")
+            }
+        }
+    }
+
+    pub fn is_stream(&self) -> bool {
+        matches!(self, Body::Stream { .. })
     }
 }
 
 impl From<Value> for Body {
     fn from(json: Value) -> Self {
-        Self {
+        Self::Bytes {
             bytes: serde_json::to_vec(&json).unwrap().into(),
             content_type: Some("application/json".into()),
         }
@@ -289,7 +333,7 @@ impl From<Value> for Body {
 
 impl From<serde_json::Map<String, Value>> for Body {
     fn from(json: serde_json::Map<String, Value>) -> Self {
-        Self {
+        Self::Bytes {
             bytes: serde_json::to_vec(&json).unwrap().into(),
             content_type: Some("application/json".into()),
         }

@@ -6,7 +6,7 @@ use crate::field_lines::FieldLines;
 use crate::transport::Transport;
 use bytes::{Bytes, BytesMut};
 use std::sync::Arc;
-use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncWriteExt, BufReader};
 use uuid::Uuid;
 
 const RESERVED_HEADERS: &[&str] = &[
@@ -259,6 +259,34 @@ impl HttpResponse<HttpResponseBodyUnInitialized> {
             _state: std::marker::PhantomData,
         }
     }
+
+    pub fn stream<R, C>(
+        mut self,
+        reader: R,
+        content_len: u64,
+        content_type: C,
+    ) -> HttpResponse<HttpResponseBodyInitialized>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        C: Into<String>,
+    {
+        let content_type = content_type.into();
+        self.field_lines.set("content-type", content_type.clone());
+        self.field_lines
+            .set("content-length", content_len.to_string());
+
+        HttpResponse {
+            stream: self.stream,
+            path: self.path,
+            http_version: self.http_version,
+            status_code: self.status_code,
+            field_lines: self.field_lines,
+            cookies: self.cookies,
+            body: Some(Body::from_stream(reader, content_len, Some(content_type))),
+            on_sent: self.on_sent,
+            _state: std::marker::PhantomData,
+        }
+    }
 }
 
 impl HttpResponse<HttpResponseBodyInitialized> {
@@ -266,6 +294,11 @@ impl HttpResponse<HttpResponseBodyInitialized> {
         let Some(body) = &self.body else {
             return self;
         };
+
+        if body.is_stream() {
+            return self;
+        }
+
         let body_bytes = body.to_bytes();
 
         // Don't compress small responses — overhead not worth it
@@ -340,8 +373,15 @@ impl<State> HttpResponse<State> {
 
         self.stream.write_all(b"\r\n").await?;
 
-        if let Some(body) = &self.body {
-            self.stream.write_all(&body.to_bytes()).await?;
+        match self.body {
+            Some(Body::Stream { reader, .. }) => {
+                let mut buffered = BufReader::with_capacity(64 * 1024, reader);
+                tokio::io::copy(&mut buffered, &mut self.stream).await?;
+            }
+            Some(Body::Bytes { bytes, .. }) => {
+                self.stream.write_all(&bytes).await?;
+            }
+            None => {}
         }
 
         self.stream.shutdown().await?;
@@ -355,50 +395,5 @@ impl<State> HttpResponse<State> {
 
     pub async fn send(self) {
         let _ = self.fallible_send().await;
-    }
-
-    pub async fn send_stream<R>(mut self, reader: R) -> Result<(), tokio::io::Error>
-    where
-        R: tokio::io::AsyncRead + Unpin,
-    {
-        let status_code = self.status_code.clone();
-        let status_bytes = self.status_code.to_bytes();
-
-        // Write status line
-        let mut response_line =
-            BytesMut::with_capacity(self.http_version.len() + status_bytes.len() + 6);
-        response_line.extend_from_slice(&self.http_version);
-        response_line.extend_from_slice(b" ");
-        response_line.extend_from_slice(&status_bytes);
-        response_line.extend_from_slice(b"\r\n");
-        self.stream.write_all(response_line.as_ref()).await?;
-
-        // Write headers
-        self.stream.write_all(&self.field_lines.to_bytes()).await?;
-
-        // Write cookies
-        if let Some(cookie_store) = &self.cookies {
-            let cookie_bytes = cookie_store.to_bytes();
-            if !cookie_bytes.is_empty() {
-                self.stream.write_all(&cookie_bytes).await?;
-            }
-        }
-
-        // End of headers
-        self.stream.write_all(b"\r\n").await?;
-
-        // Stream body in chunks — default buf size is 8KB, plenty for most files
-        // For large files this keeps memory usage flat regardless of file size
-        let mut buffered = BufReader::with_capacity(64 * 1024, reader);
-        tokio::io::copy(&mut buffered, &mut self.stream).await?;
-        tokio::io::copy(&mut buffered, &mut self.stream).await?;
-
-        self.stream.shutdown().await?;
-
-        if let Some(hook) = self.on_sent.take() {
-            hook(status_code);
-        }
-
-        Ok(())
     }
 }
