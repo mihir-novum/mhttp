@@ -37,9 +37,13 @@ pub struct HttpCall {
 }
 
 impl HttpCall {
-    async fn parse(stream: Transport, request_id: Uuid) -> Result<Self, HttpRequestError> {
+    async fn parse(
+        stream: Transport,
+        request_id: Uuid,
+        max_body_size: usize,
+    ) -> Result<Self, HttpRequestError> {
         let mut reader = BufReader::new(stream);
-        let request = HttpRequest::parse(&mut reader).await?;
+        let request = HttpRequest::parse(&mut reader, max_body_size).await?;
         let http_version = request.http_version().clone();
         Ok(Self {
             response: Some(HttpResponse::new(
@@ -207,6 +211,8 @@ pub struct HttpServer {
     on_request_complete: Option<OnRequestComplete>,
     cors: Option<Cors>,
     tls: Option<TlsAcceptor>,
+    request_timeout: std::time::Duration,
+    max_body_size: usize,
 }
 
 impl HttpServer {
@@ -225,6 +231,8 @@ impl HttpServer {
             on_request_complete: None,
             cors,
             tls: None,
+            request_timeout: std::time::Duration::from_secs(60),
+            max_body_size: 10 * 1024 * 1024,
         })
     }
 
@@ -247,6 +255,16 @@ impl HttpServer {
             tls: Some(tls_config.build()?),
             ..Self::bind(port, cors).await?
         })
+    }
+
+    pub fn request_timeout(mut self, duration: std::time::Duration) -> Self {
+        self.request_timeout = duration;
+        self
+    }
+
+    pub fn max_body_size(mut self, bytes: usize) -> Self {
+        self.max_body_size = bytes;
+        self
     }
 
     pub fn on_request_complete<F, Fut>(mut self, f: F) -> Self
@@ -303,11 +321,15 @@ impl HttpServer {
     }
 
     async fn handle_request(&self, stream: Transport, request_id: Uuid) {
-        let mut call: HttpCall = match HttpCall::parse(stream, request_id).await {
-            Ok(call) => call,
-            Err(_) => {
-                return;
-            }
+        let mut call: HttpCall = match tokio::time::timeout(
+            self.request_timeout,
+            HttpCall::parse(stream, request_id, self.max_body_size),
+        )
+        .await
+        {
+            Ok(Ok(call)) => call,
+            Ok(Err(_)) => return,
+            Err(_) => return,
         };
 
         if let Some(cors) = &self.cors {
@@ -357,7 +379,13 @@ impl HttpServer {
             route.route.is_match(call.request.route()) && &route.method == call.request.method()
         }) {
             Some(route) => route,
-            None => return,
+            None => {
+                call.response()
+                    .status_code(HttpStatusCode::NotFound)
+                    .send()
+                    .await;
+                return;
+            }
         };
 
         call.request.parse_params(&route.route);

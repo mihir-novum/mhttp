@@ -1,6 +1,7 @@
 use crate::body::Body;
 use crate::cookie_store::CookieStore;
 use crate::field_lines::FieldLines;
+use crate::transport::Transport;
 use bytes::Bytes;
 use regex::Regex;
 use std::collections::HashMap;
@@ -9,7 +10,6 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, BufReader};
-use crate::transport::Transport;
 
 #[derive(thiserror::Error, Debug)]
 pub enum HttpRequestError {
@@ -23,6 +23,8 @@ pub enum HttpRequestError {
     RequestParsingFailed(String),
     #[error("invalid http method")]
     InvalidHttpMethod(),
+    #[error("payload too large")]
+    PayloadTooLarge,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -150,7 +152,10 @@ pub(crate) struct HttpRequest {
 }
 
 impl HttpRequest {
-    pub(crate) async fn parse<S>(reader: &mut BufReader<S>) -> Result<Self, HttpRequestError>
+    pub(crate) async fn parse<S>(
+        reader: &mut BufReader<S>,
+        max_body_size: usize,
+    ) -> Result<Self, HttpRequestError>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + PeerAddr + 'static,
     {
@@ -231,6 +236,10 @@ impl HttpRequest {
             .get("content-type")
             .unwrap_or_default()
             .to_owned();
+
+        if content_length > max_body_size {
+            return Err(HttpRequestError::PayloadTooLarge);
+        }
 
         let body = {
             let mut buffer = vec![0; content_length];
