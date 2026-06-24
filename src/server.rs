@@ -7,6 +7,7 @@ use crate::route_definition::{RouteDefinition, RouteDefinitionError, RouteFactor
 use crate::tls::{TlsConfig, TlsConfigError};
 use crate::transport::Transport;
 use crate::{HttpMethod, HttpStatusCode};
+use bytes::Bytes;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -41,9 +42,14 @@ impl HttpCall {
         stream: Transport,
         request_id: Uuid,
         max_body_size: usize,
-    ) -> Result<Self, HttpRequestError> {
+    ) -> Result<Self, (Transport, HttpRequestError)> {
         let mut reader = BufReader::new(stream);
-        let request = HttpRequest::parse(&mut reader, max_body_size).await?;
+        let request = match HttpRequest::parse(&mut reader, max_body_size).await {
+            Ok(request) => request,
+            Err(err) => {
+                return Err((reader.into_inner(), err));
+            }
+        };
         let http_version = request.http_version().clone();
         Ok(Self {
             response: Some(HttpResponse::new(
@@ -328,7 +334,23 @@ impl HttpServer {
         .await
         {
             Ok(Ok(call)) => call,
-            Ok(Err(_)) => return,
+            Ok(Err((stream, err))) => {
+                let status = match err {
+                    HttpRequestError::PayloadTooLarge => HttpStatusCode::ContentTooLarge,
+                    _ => HttpStatusCode::BadRequest,
+                };
+
+                let _ = HttpResponse::new(
+                    stream,
+                    Bytes::from_static(b"HTTP/1.1"),
+                    request_id,
+                    Arc::from(""),
+                )
+                .status_code(status)
+                .send()
+                .await;
+                return;
+            }
             Err(_) => return,
         };
 
@@ -375,8 +397,18 @@ impl HttpServer {
             call.response = Some(resp.set_on_set(hook))
         }
 
+        let is_head = *call.method() == HttpMethod::HEAD;
+
+        if is_head {
+            if let Some(resp) = call.response.take() {
+                call.response = Some(resp.suppress_body());
+            }
+        }
+
         let route = match self.routes.iter().find(|route| {
-            route.route.is_match(call.request.route()) && &route.method == call.request.method()
+            let method_match = &route.method == call.request.method()
+                || (is_head && route.method == HttpMethod::GET);
+            route.route.is_match(call.request.route()) && method_match
         }) {
             Some(route) => route,
             None => {

@@ -22,6 +22,7 @@ const RESERVED_HEADERS: &[&str] = &[
     "cookie",
     "set-cookie",
     "accept-encoding",
+    "date",
 ];
 
 #[derive(Debug, Clone)]
@@ -39,6 +40,7 @@ pub enum HttpStatusCode {
     NotImplemented,
     BadGateWay,
     ServiceUnavailable,
+    ContentTooLarge,
 }
 
 impl HttpStatusCode {
@@ -52,6 +54,7 @@ impl HttpStatusCode {
             HttpStatusCode::Unauthorized => Bytes::from("401 Unauthorized"),
             HttpStatusCode::Forbidden => Bytes::from("403 Forbidden"),
             HttpStatusCode::NotFound => Bytes::from("404 Not Found"),
+            HttpStatusCode::ContentTooLarge => Bytes::from("413 Content Too Large"),
             HttpStatusCode::InternalServerError => Bytes::from("500 Internal Server Error"),
             HttpStatusCode::NotImplemented => Bytes::from("501 Not Implemented"),
             HttpStatusCode::BadGateWay => Bytes::from("502 Bad Gateway"),
@@ -71,6 +74,7 @@ impl From<HttpStatusCode> for u16 {
             HttpStatusCode::Unauthorized => 401,
             HttpStatusCode::Forbidden => 403,
             HttpStatusCode::NotFound => 404,
+            HttpStatusCode::ContentTooLarge => 413,
             HttpStatusCode::InternalServerError => 500,
             HttpStatusCode::NotImplemented => 501,
             HttpStatusCode::BadGateWay => 502,
@@ -92,6 +96,7 @@ pub struct HttpResponse<State> {
     body: Option<Body>,
     field_lines: FieldLines,
     cookies: Option<CookieStore>,
+    suppress_body: bool,
     on_sent: Option<ResponseHook>,
     _state: std::marker::PhantomData<State>,
 }
@@ -117,6 +122,7 @@ impl HttpResponse<HttpResponseBodyUnInitialized> {
             body: None,
             field_lines,
             cookies: None,
+            suppress_body: false,
             on_sent: None,
             _state: std::marker::PhantomData,
         }
@@ -224,6 +230,7 @@ impl HttpResponse<HttpResponseBodyUnInitialized> {
             status_code: self.status_code,
             field_lines: self.field_lines,
             cookies: self.cookies,
+            suppress_body: self.suppress_body,
             body: Some(Body::from(&json_bytes, Some("application/json".to_owned()))),
             on_sent: self.on_sent,
             _state: std::marker::PhantomData,
@@ -254,6 +261,7 @@ impl HttpResponse<HttpResponseBodyUnInitialized> {
             status_code: self.status_code,
             field_lines: self.field_lines,
             cookies: self.cookies,
+            suppress_body: self.suppress_body,
             body: Some(Body::from(&bytes, Some(content_type))),
             on_sent: self.on_sent,
             _state: std::marker::PhantomData,
@@ -282,6 +290,7 @@ impl HttpResponse<HttpResponseBodyUnInitialized> {
             status_code: self.status_code,
             field_lines: self.field_lines,
             cookies: self.cookies,
+            suppress_body: self.suppress_body,
             body: Some(Body::from_stream(reader, content_len, Some(content_type))),
             on_sent: self.on_sent,
             _state: std::marker::PhantomData,
@@ -398,7 +407,19 @@ impl HttpResponse<HttpResponseBodyInitialized> {
 }
 
 impl<State> HttpResponse<State> {
+    pub(crate) fn suppress_body(mut self) -> Self {
+        self.suppress_body = true;
+        self
+    }
+
     pub async fn fallible_send(mut self) -> Result<(), tokio::io::Error> {
+        self.field_lines.set(
+            "date",
+            chrono::Utc::now()
+                .format("%a, %d %b %Y %H:%M:%S GMT")
+                .to_string(),
+        );
+
         let status_code = self.status_code;
         let status_code_copy = status_code.clone();
 
@@ -422,55 +443,57 @@ impl<State> HttpResponse<State> {
 
         self.stream.write_all(b"\r\n").await?;
 
-        match self.body {
-            Some(Body::Stream { reader, .. }) => {
-                let is_chunked = self
-                    .field_lines
-                    .get("transfer-encoding")
-                    .map(|v| v.contains("chunked"))
-                    .unwrap_or(false);
+        if !self.suppress_body {
+            match self.body {
+                Some(Body::Stream { reader, .. }) => {
+                    let is_chunked = self
+                        .field_lines
+                        .get("transfer-encoding")
+                        .map(|v| v.contains("chunked"))
+                        .unwrap_or(false);
 
-                let mut buffered = BufReader::with_capacity(64 * 1024, reader);
+                    let mut buffered = BufReader::with_capacity(64 * 1024, reader);
 
-                if is_chunked {
-                    let mut buf = vec![0u8; 64 * 1024];
-                    loop {
-                        let n = buffered.read(&mut buf).await?;
-                        if n == 0 {
-                            break;
+                    if is_chunked {
+                        let mut buf = vec![0u8; 64 * 1024];
+                        loop {
+                            let n = buffered.read(&mut buf).await?;
+                            if n == 0 {
+                                break;
+                            }
+
+                            self.stream
+                                .write_all(format!("{:X}\r\n", n).as_bytes())
+                                .await?;
+                            self.stream.write_all(&buf[..n]).await?;
+                            self.stream.write_all(b"\r\n").await?;
                         }
 
-                        self.stream
-                            .write_all(format!("{:X}\r\n", n).as_bytes())
-                            .await?;
-                        self.stream.write_all(&buf[..n]).await?;
-                        self.stream.write_all(b"\r\n").await?;
+                        self.stream.write_all(b"0\r\n\r\n").await?;
+                    } else {
+                        tokio::io::copy(&mut buffered, &mut self.stream).await?;
                     }
-
-                    self.stream.write_all(b"0\r\n\r\n").await?;
-                } else {
-                    tokio::io::copy(&mut buffered, &mut self.stream).await?;
                 }
-            }
-            Some(Body::Bytes { bytes, .. }) => {
-                let is_chunked = self
-                    .field_lines
-                    .get("transfer-encoding")
-                    .map(|v| v.contains("chunked"))
-                    .unwrap_or(false);
+                Some(Body::Bytes { bytes, .. }) => {
+                    let is_chunked = self
+                        .field_lines
+                        .get("transfer-encoding")
+                        .map(|v| v.contains("chunked"))
+                        .unwrap_or(false);
 
-                if is_chunked {
-                    self.stream
-                        .write_all(format!("{:X}\r\n", bytes.len()).as_bytes())
-                        .await?;
-                    self.stream.write_all(&bytes).await?;
-                    self.stream.write_all(b"\r\n").await?;
-                    self.stream.write_all(b"0\r\n\r\n").await?;
-                } else {
-                    self.stream.write_all(&bytes).await?;
+                    if is_chunked {
+                        self.stream
+                            .write_all(format!("{:X}\r\n", bytes.len()).as_bytes())
+                            .await?;
+                        self.stream.write_all(&bytes).await?;
+                        self.stream.write_all(b"\r\n").await?;
+                        self.stream.write_all(b"0\r\n\r\n").await?;
+                    } else {
+                        self.stream.write_all(&bytes).await?;
+                    }
                 }
+                None => {}
             }
-            None => {}
         }
 
         self.stream.shutdown().await?;
