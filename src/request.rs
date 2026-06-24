@@ -226,25 +226,43 @@ impl HttpRequest {
             .map(|h| Arc::from(h.trim()))
             .or(None);
 
-        let content_length = field_lines
-            .get("content-length")
-            .unwrap_or("0")
-            .parse::<usize>()
-            .unwrap();
-
         let content_type = field_lines
             .get("content-type")
             .unwrap_or_default()
             .to_owned();
 
-        if content_length > max_body_size {
-            return Err(HttpRequestError::PayloadTooLarge);
-        }
+        let is_chunked = field_lines
+            .get("transfer-encoding")
+            .map(|v| v.contains("chunked"))
+            .unwrap_or(false);
 
-        let body = {
-            let mut buffer = vec![0; content_length];
-            reader.read_exact(&mut buffer).await.unwrap();
-            Bytes::from(buffer)
+        let body = if is_chunked {
+            match Body::read_chunked(reader, max_body_size, Some(content_type)).await {
+                Ok(v) => v,
+                Err(e) => {
+                    return match e.as_str() {
+                        "body too large" => Err(HttpRequestError::PayloadTooLarge),
+                        err => Err(HttpRequestError::BodyParsingFailed(err.to_string())),
+                    };
+                }
+            }
+        } else {
+            let content_length = field_lines
+                .get("content-length")
+                .unwrap_or("0")
+                .parse::<usize>()
+                .unwrap();
+
+            match Body::read_exact(reader, content_length, max_body_size, Some(content_type)).await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    return match e.as_str() {
+                        "body too large" => Err(HttpRequestError::PayloadTooLarge),
+                        err => Err(HttpRequestError::BodyParsingFailed(err.to_string())),
+                    };
+                }
+            }
         };
 
         let cookies = match field_lines.get("cookie") {
@@ -276,7 +294,7 @@ impl HttpRequest {
             field_lines,
             path_params: HashMap::new(),
             query_params: HashMap::new(),
-            body: Body::from(&body, Some(content_type)),
+            body,
             cookies,
         })
     }

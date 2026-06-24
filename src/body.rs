@@ -4,7 +4,7 @@ use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 use serde_json::Value;
 use std::collections::HashMap;
-use tokio::io::AsyncBufReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, BufReader};
 
 #[derive(thiserror::Error, Debug)]
 pub enum MultipartError {
@@ -244,7 +244,7 @@ pub enum Body {
         content_type: Option<String>,
     },
     Stream {
-        reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+        reader: Box<dyn AsyncRead + Unpin + Send>,
         content_length: u64,
         content_type: Option<String>,
     },
@@ -264,13 +264,103 @@ impl Body {
         content_type: Option<String>,
     ) -> Self
     where
-        R: tokio::io::AsyncRead + Unpin + Send + 'static,
+        R: AsyncRead + Unpin + Send + 'static,
     {
         Self::Stream {
             reader: Box::new(reader),
             content_length,
             content_type,
         }
+    }
+
+    pub(crate) async fn read_exact<R>(
+        reader: &mut BufReader<R>,
+        content_len: usize,
+        max_body_size: usize,
+        content_type: Option<String>,
+    ) -> Result<Self, String>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+    {
+        if content_len > max_body_size {
+            return Err("body too large".to_string());
+        }
+
+        let mut buffer = vec![0; content_len];
+        reader
+            .read_exact(&mut buffer)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        Ok(Self::Bytes {
+            bytes: buffer.into(),
+            content_type,
+        })
+    }
+
+    pub(crate) async fn read_chunked<R>(
+        reader: &mut BufReader<R>,
+        max_body_size: usize,
+        content_type: Option<String>,
+    ) -> Result<Body, String>
+    where
+        R: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let mut body = Vec::new();
+
+        loop {
+            let mut size_line = Vec::new();
+            reader
+                .read_until(b'\n', &mut size_line)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            let size_str = std::str::from_utf8(&size_line)
+                .map_err(|e| "invalid chunk size line")?
+                .trim()
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim();
+
+            let chunk_size = usize::from_str_radix(size_str, 16)
+                .map_err(|_e| format!("invalid chunk size: '{}'", size_str))?;
+
+            if chunk_size == 0 {
+                let mut trailing = Vec::new();
+                reader
+                    .read_until(b'\n', &mut trailing)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                break;
+            }
+
+            if body.len() + chunk_size > max_body_size {
+                return Err("body too large".to_string());
+            }
+
+            let mut chunk = vec![0; chunk_size];
+            reader
+                .read_exact(&mut chunk)
+                .await
+                .map_err(|e| e.to_string())?;
+            body.extend_from_slice(&chunk);
+
+            let mut crlf = [0u8; 2];
+            reader
+                .read_exact(&mut crlf)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            if &crlf != b"\r\n" {
+                return Err("missing CRLF after chunk data".to_string());
+            }
+        }
+
+        Ok(Self::Bytes {
+            bytes: body.into(),
+            content_type,
+        })
     }
 
     pub fn as_json(&self) -> Option<Value> {
