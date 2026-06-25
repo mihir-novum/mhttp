@@ -3,17 +3,18 @@ use crate::body::Body;
 use crate::connection::Connection;
 use crate::cors::Cors;
 use crate::request::{HttpRequest, HttpRequestError};
-use crate::response::{HttpResponse, HttpResponseInit};
+use crate::response::{HttpResponse, HttpResponseInit, ResponseHook};
 use crate::route_definition::{RouteDefinition, RouteDefinitionError, RouteFactory};
 use crate::tls::{TlsConfig, TlsConfigError};
 use crate::transport::Transport;
 use crate::{HttpMethod, HttpStatusCode};
 use bytes::Bytes;
+use socket2::Socket;
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
-use telemetry::{__InstrumentTrait, warn};
+use telemetry::__InstrumentTrait;
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
@@ -34,6 +35,9 @@ pub struct HttpCall {
     request: HttpRequest,
     extras: HashMap<String, String>,
     request_id: Uuid,
+    restart_tx: tokio::sync::mpsc::UnboundedSender<bool>,
+    response_hook: Option<ResponseHook>,
+    suppress_body: bool,
 }
 
 impl HttpCall {
@@ -41,6 +45,7 @@ impl HttpCall {
         transport: Transport,
         request_id: Uuid,
         max_body_size: usize,
+        restart_tx: tokio::sync::mpsc::UnboundedSender<bool>,
     ) -> Result<Self, (Transport, HttpRequestError)> {
         let mut connection = Connection::new(transport);
 
@@ -54,11 +59,18 @@ impl HttpCall {
             request,
             extras: HashMap::new(),
             request_id,
+            restart_tx,
+            response_hook: None,
+            suppress_body: false,
         })
     }
 
     pub(crate) fn method(&self) -> &HttpMethod {
         self.request.method()
+    }
+
+    pub fn restart(&self, force: bool) {
+        let _ = self.restart_tx.send(force);
     }
 
     pub fn client_ipv4_address(&self) -> Option<Ipv4Addr> {
@@ -141,14 +153,32 @@ impl HttpCall {
 
 impl HttpCall {
     pub fn response(&mut self) -> HttpResponseInit<'_> {
+        let mut response = HttpResponse::new(
+            self.request.http_version().clone(),
+            self.request_id,
+            Arc::from(self.request.route()),
+        );
+
+        if let Some(hook) = self.response_hook.take() {
+            response = response.set_on_set(hook);
+        }
+
+        if self.suppress_body {
+            response = response.suppress_body();
+        }
+
         HttpResponseInit {
             connection: &mut self.connection,
-            response: HttpResponse::new(
-                self.request.http_version().clone(),
-                self.request_id,
-                Arc::from(self.request.route()),
-            ),
+            response,
         }
+    }
+
+    pub(crate) fn set_response_hook(&mut self, hook: ResponseHook) {
+        self.response_hook = Some(hook);
+    }
+
+    pub(crate) fn set_suppress_body(&mut self) {
+        self.suppress_body = true;
     }
 }
 
@@ -214,7 +244,7 @@ type OnRequestComplete =
 
 pub struct HttpServer {
     routes: Vec<RouteDefinition>,
-    listener: TcpListener,
+    listener: Option<TcpListener>,
     active_requests: ActiveRequest,
     on_request_complete: Option<OnRequestComplete>,
     cors: Option<Cors>,
@@ -229,18 +259,37 @@ impl HttpServer {
         HttpServerBuilder::new(port)
     }
 
-    pub async fn listen(self) {
+    pub async fn listen(mut self) {
+        let listener = self.listener.take().expect("Listener must be initialized");
         let server = Arc::new(self);
+
+        // Channel for programmatic restart triggers (from your route handlers)
+        let (restart_tx, mut restart_rx) = tokio::sync::mpsc::unbounded_channel::<bool>();
+
+        // Channel for the background task to report if the new process lived or died
+        let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel::<Result<bool, ()>>();
+
         let mut thread_pool: JoinSet<()> = JoinSet::new();
 
-        loop {
+        // Lock to prevent multiple spawn attempts running at the exact same time
+        let mut restart_in_progress = false;
+
+        // Docker SIGTERM listener
+        #[cfg(unix)]
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+
+        // Loop-as-expression: break produces the `force` bool directly, no Option needed.
+        let force: bool = loop {
             tokio::select! {
-                Ok((stream, _)) = server.listener.accept() => {
-                    let server = server.clone();
+                // 1. Keep accepting connections seamlessly!
+                Ok((stream, _)) = listener.accept() => {
+                    let server_clone = server.clone();
+                    let restart_tx = restart_tx.clone();
                     let context = telemetry::create_context!("http.request");
 
                     thread_pool.spawn(async move {
-                        let transport = match &server.tls {
+                        let transport = match &server_clone.tls {
                             None => {
                                 let peer_addr = stream.peer_addr().unwrap();
                                 Transport::new(stream, peer_addr)
@@ -252,7 +301,7 @@ impl HttpServer {
                                         Transport::new(tls_stream, peer_addr)
                                     }
                                     Err(e) => {
-                                        warn!("TLS error: {}", e);
+                                        println!("TLS error: {}", e);
                                         return;
                                     }
                                 }
@@ -260,35 +309,134 @@ impl HttpServer {
                         };
 
                         // One task per connection, many requests per connection
-                        server.handle_connection(transport).await;
+                        server_clone.handle_connection(transport, restart_tx).await;
                     }.instrument(context));
                 }
+
+                // 2. A restart is triggered from a route handler
+                Some(force) = restart_rx.recv() => {
+                    // Check the lock: if we are already restarting, discard duplicate requests
+                    if restart_in_progress {
+                        println!("Restart already in progress. Ignoring duplicate request.");
+                        continue;
+                    }
+
+                    restart_in_progress = true; // Lock it!
+                    println!("Program restart triggered! Force: {}", force);
+
+                    let mut current_exe = match std::env::current_exe() {
+                        Ok(exe) => exe,
+                        Err(e) => {
+                            println!("Failed to get executable path: {}", e);
+                            restart_in_progress = false; // Unlock on failure
+                            continue;
+                        }
+                    };
+
+                    if !current_exe.exists() {
+                        let argv0 = std::env::args().next().unwrap();
+                        current_exe = std::path::PathBuf::from(argv0);
+                    }
+
+                    println!("Spawning new process: {}", current_exe.display());
+
+                    let mut child = match std::process::Command::new(current_exe)
+                        .args(std::env::args().skip(1))
+                        .spawn()
+                    {
+                        Ok(c) => c,
+                        Err(e) => {
+                            println!("Failed to spawn new process: {}", e);
+                            restart_in_progress = false; // Unlock on failure
+                            continue;
+                        }
+                    };
+
+                    telemetry::info!("New process spawned (PID {}). Verifying stability in background...", child.id());
+
+                    let result_tx = result_tx.clone();
+
+                    // BACKGROUND stability check (does not block accept loop!)
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+                        if let Ok(Some(status)) = child.try_wait() {
+                            println!("New instance crashed with status: {}.", status);
+                            let _ = result_tx.send(Err(())); // Send Failure
+                        } else {
+                            let _ = result_tx.send(Ok(force)); // Send Success
+                        }
+                    });
+                }
+
+                // 3. Background stability check result received
+                Some(result) = result_rx.recv() => {
+                    match result {
+                        Ok(force) => {
+                            println!("New instance is stable. Old instance handing over traffic.");
+                            break force; // Loop produces the force value
+                        }
+                        Err(_) => {
+                            println!("Restart failed. Unlocking for future restart attempts.");
+                            // Unlock so developers can try fixing the code/config and hit /restart again!
+                            restart_in_progress = false;
+                        }
+                    }
+                }
+
+                // 4. Docker / Manual SIGINT (Ctrl+C)
+                _ = tokio::signal::ctrl_c() => {
+                    println!("Received Ctrl+C (SIGINT). Initiating graceful shutdown...");
+                    break false; // Always graceful for OS signals
+                }
+
+                // 5. Docker / Kubernetes SIGTERM
+                _ = async {
+                        #[cfg(unix)]
+                        sigterm.recv().await;
+                        #[cfg(not(unix))]
+                        std::future::pending::<()>().await;
+                    } => {
+                        println!("Received SIGTERM from Docker/Kubernetes. Initiating graceful shutdown...");
+                        break false; // Always graceful for OS signals
+                    }
             }
+        };
+
+        // --- Server Shutdown Phase ---
+        // Drop the listener. In Docker, the Load Balancer spots this.
+        // In Bare-Metal, the OS instantly reroutes 100% of new traffic to the new PID.
+        drop(listener);
+
+        if force {
+            println!("Force flag provided. Aborting active tasks...");
+            thread_pool.abort_all();
+        } else {
+            println!("Graceful shutdown. Waiting for active tasks to finish...");
+            // Uses the `Notify` ActiveSet implementation
+            server.active_requests.wait_for_zero().await;
         }
+
+        println!("Old instance shutdown complete.");
+        std::process::exit(0);
     }
 
-    async fn handle_connection(&self, mut transport: Transport) {
+    async fn handle_connection(
+        &self,
+        mut transport: Transport,
+        restart_tx: tokio::sync::mpsc::UnboundedSender<bool>,
+    ) {
         loop {
             let request_id = Uuid::new_v4();
 
             match tokio::time::timeout(
-                self.keep_alive_timeout, // idle timeout between requests
-                self.handle_single_request(transport, request_id),
+                self.keep_alive_timeout,
+                self.handle_single_request(transport, request_id, restart_tx.clone()), // Pass tx
             )
             .await
             {
-                Ok(Some(returned_transport)) => {
-                    // Client wants keep-alive — loop with same transport
-                    transport = returned_transport;
-                }
-                Ok(None) => {
-                    // Connection: close or error — done
-                    break;
-                }
-                Err(_) => {
-                    // Client idle too long — close silently
-                    break;
-                }
+                Ok(Some(returned_transport)) => transport = returned_transport,
+                Ok(None) | Err(_) => break,
             }
         }
     }
@@ -297,10 +445,11 @@ impl HttpServer {
         &self,
         transport: Transport,
         request_id: Uuid,
+        restart_tx: tokio::sync::mpsc::UnboundedSender<bool>,
     ) -> Option<Transport> {
         let mut call: HttpCall = match tokio::time::timeout(
             self.request_timeout,
-            HttpCall::parse(transport, request_id, self.max_body_size),
+            HttpCall::parse(transport, request_id, self.max_body_size, restart_tx),
         )
         .await
         {
@@ -346,7 +495,7 @@ impl HttpServer {
             }
         }
 
-        let _guard = self.active_requests.insert(
+        let guard = self.active_requests.insert(
             request_id,
             RequestInfo::new(
                 request_id,
@@ -355,7 +504,33 @@ impl HttpServer {
             ),
         );
 
+        {
+            let g = guard.clone();
+            let on_complete = self.on_request_complete.clone();
+            let hook: ResponseHook = Arc::new(move |status_code| {
+                g.update(|info| {
+                    info.set_response_status(status_code.clone());
+                    info.mark_as_end();
+                });
+                if let Some(on_request_complete) = &on_complete
+                    && let Some(info) = g.value()
+                {
+                    let fut = on_request_complete({
+                        let mut info = info.clone();
+                        info.set_response_status(status_code);
+                        info
+                    });
+                    telemetry::spawn!(fut);
+                }
+            });
+            call.set_response_hook(hook);
+        }
+
         let is_head = *call.method() == HttpMethod::HEAD;
+
+        if is_head {
+            call.set_suppress_body();
+        }
 
         let route = match self.routes.iter().find(|route| {
             let method_match = &route.method == call.request.method()
@@ -472,8 +647,29 @@ impl HttpServerBuilder {
 
     pub async fn build(self) -> Result<HttpServer, HttpServerError> {
         let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
-        let listener = TcpListener::bind(addr)
-            .await
+        let domain = if addr.is_ipv6() {
+            socket2::Domain::IPV6
+        } else {
+            socket2::Domain::IPV4
+        };
+
+        let socket = Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
+            .map_err(|_| HttpServerError::AddrInUse(self.port))?;
+
+        socket.set_reuse_address(true).unwrap_or(());
+        #[cfg(any(target_family = "unix"))]
+        socket.set_reuse_port(true).unwrap_or(());
+
+        socket
+            .bind(&addr.into())
+            .map_err(|_| HttpServerError::AddrInUse(self.port))?;
+        socket
+            .listen(1024)
+            .map_err(|_| HttpServerError::AddrInUse(self.port))?;
+        socket.set_nonblocking(true).unwrap_or(());
+
+        let std_listener: std::net::TcpListener = socket.into();
+        let listener = tokio::net::TcpListener::from_std(std_listener)
             .map_err(|_| HttpServerError::AddrInUse(self.port))?;
 
         let tls = if let Some(tls_config) = self.tls_config {
@@ -486,7 +682,7 @@ impl HttpServerBuilder {
 
         Ok(HttpServer {
             routes: self.routes,
-            listener,
+            listener: Some(listener),
             active_requests: ActiveRequest::new(),
             on_request_complete: self.on_request_complete,
             cors: self.cors,

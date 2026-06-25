@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
 
 pub struct ActiveSet<Id, Info> {
     inner: Arc<Inner<Id, Info>>,
@@ -10,7 +11,7 @@ pub struct ActiveSet<Id, Info> {
 struct Inner<Id, Info> {
     map: Mutex<HashMap<Id, Info>>,
     count: AtomicUsize,
-    empty_cv: Condvar,
+    empty_notify: Notify,
 }
 
 pub struct ActiveGuard<Id, Info>
@@ -31,7 +32,7 @@ where
             inner: Arc::new(Inner {
                 map: Mutex::new(HashMap::new()),
                 count: AtomicUsize::new(0),
-                empty_cv: Condvar::new(),
+                empty_notify: Notify::new(),
             }),
         }
     }
@@ -82,15 +83,13 @@ where
         self.inner.map.lock().unwrap().clone()
     }
 
-    pub fn wait_for_zero(&self) {
-        let mut guard = self.inner.map.lock().unwrap();
-
+    pub async fn wait_for_zero(&self) {
         loop {
             if self.inner.count.load(std::sync::atomic::Ordering::SeqCst) == 0 {
                 return;
             }
 
-            guard = self.inner.empty_cv.wait(guard).unwrap();
+            self.inner.empty_notify.notified().await;
         }
     }
 }
@@ -145,7 +144,7 @@ where
             debug_assert!(prev > 0);
 
             if prev == 1 {
-                self.inner.empty_cv.notify_all();
+                self.inner.empty_notify.notify_waiters();
             }
         }
     }

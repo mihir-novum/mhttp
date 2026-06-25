@@ -316,7 +316,7 @@ impl Body {
                 .map_err(|e| e.to_string())?;
 
             let size_str = std::str::from_utf8(&size_line)
-                .map_err(|e| "invalid chunk size line")?
+                .map_err(|_| "invalid chunk size line")?
                 .trim()
                 .split(';')
                 .next()
