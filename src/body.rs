@@ -274,7 +274,7 @@ impl Body {
     }
 
     pub(crate) async fn read_exact<R>(
-        reader: &mut BufReader<R>,
+        reader: &mut BufReader<&mut R>,
         content_len: usize,
         max_body_size: usize,
         content_type: Option<String>,
@@ -299,7 +299,7 @@ impl Body {
     }
 
     pub(crate) async fn read_chunked<R>(
-        reader: &mut BufReader<R>,
+        reader: &mut BufReader<&mut R>,
         max_body_size: usize,
         content_type: Option<String>,
     ) -> Result<Body, String>

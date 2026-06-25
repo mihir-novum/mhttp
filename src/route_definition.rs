@@ -1,9 +1,7 @@
-use crate::request::{HttpMethod, PeerAddr};
+use crate::request::HttpMethod;
 use crate::server::HttpCall;
 use regex::Regex;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpStream;
 
 #[derive(thiserror::Error, Debug)]
 pub enum RouteDefinitionError {

@@ -1,6 +1,5 @@
 use crate::{HttpCall, HttpStatusCode};
 use std::path::Path;
-use tokio::io::AsyncReadExt;
 
 pub struct StaticFileOptions {
     pub dir: &'static str,
@@ -29,6 +28,7 @@ pub async fn serve_static(call: &mut HttpCall, opts: StaticFileOptions) {
         Err(_) => {
             call.response()
                 .status_code(HttpStatusCode::InternalServerError)
+                .empty()
                 .send()
                 .await;
             return;
@@ -47,6 +47,7 @@ pub async fn serve_static(call: &mut HttpCall, opts: StaticFileOptions) {
     if !canonical_req.starts_with(&canonical_base) {
         call.response()
             .status_code(HttpStatusCode::Forbidden)
+            .empty()
             .send()
             .await;
         return;
@@ -71,6 +72,7 @@ async fn serve_index(call: &mut HttpCall, base: &Path, index: Option<&'static st
             } else {
                 call.response()
                     .status_code(HttpStatusCode::NotFound)
+                    .empty()
                     .send()
                     .await;
             }
@@ -78,6 +80,7 @@ async fn serve_index(call: &mut HttpCall, base: &Path, index: Option<&'static st
         None => {
             call.response()
                 .status_code(HttpStatusCode::Forbidden)
+                .empty()
                 .send()
                 .await;
         }
@@ -92,6 +95,7 @@ async fn serve_file(call: &mut HttpCall, path: &Path) {
         Err(_) => {
             call.response()
                 .status_code(HttpStatusCode::NotFound)
+                .empty()
                 .send()
                 .await;
             return;
@@ -104,6 +108,7 @@ async fn serve_file(call: &mut HttpCall, path: &Path) {
         Err(_) => {
             call.response()
                 .status_code(HttpStatusCode::InternalServerError)
+                .empty()
                 .send()
                 .await;
             return;

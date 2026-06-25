@@ -9,7 +9,7 @@ use std::fmt::{Display, Formatter};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 #[derive(thiserror::Error, Debug)]
 pub enum HttpRequestError {
@@ -127,16 +127,6 @@ impl HttpParam {
     }
 }
 
-pub trait PeerAddr {
-    fn peer_addr(&self) -> std::io::Result<SocketAddr>;
-}
-
-impl PeerAddr for Transport {
-    fn peer_addr(&self) -> std::io::Result<SocketAddr> {
-        Ok(self.peer_addr())
-    }
-}
-
 pub(crate) struct HttpRequest {
     client_ipv4_address: Option<Ipv4Addr>,
     client_ipv6_address: Option<Ipv6Addr>,
@@ -152,17 +142,11 @@ pub(crate) struct HttpRequest {
 }
 
 impl HttpRequest {
-    pub(crate) async fn parse<S>(
-        reader: &mut BufReader<S>,
+    pub(crate) async fn parse(
+        reader: &mut BufReader<&mut Transport>,
+        peer_addr: SocketAddr,
         max_body_size: usize,
-    ) -> Result<Self, HttpRequestError>
-    where
-        S: AsyncRead + AsyncWrite + Unpin + Send + Sync + PeerAddr + 'static,
-    {
-        let peer_addr: SocketAddr = reader.get_ref().peer_addr().map_err(|e| {
-            HttpRequestError::RequestParsingFailed(format!("Failed to get peer addr: {e}"))
-        })?;
-
+    ) -> Result<Self, HttpRequestError> {
         let (client_ipv4_address, client_ipv6_address) = match peer_addr.ip() {
             IpAddr::V4(ip) => (Some(ip), None),
             IpAddr::V6(ip) => (None, Some(ip)),

@@ -1,21 +1,20 @@
 use crate::active_set::ActiveSet;
 use crate::body::Body;
+use crate::connection::Connection;
 use crate::cors::Cors;
-use crate::request::{HttpRequest, HttpRequestError, PeerAddr};
-use crate::response::{HttpResponse, HttpResponseBodyUnInitialized, ResponseHook};
+use crate::request::{HttpRequest, HttpRequestError};
+use crate::response::{HttpResponse, HttpResponseInit};
 use crate::route_definition::{RouteDefinition, RouteDefinitionError, RouteFactory};
 use crate::tls::{TlsConfig, TlsConfigError};
 use crate::transport::Transport;
 use crate::{HttpMethod, HttpStatusCode};
 use bytes::Bytes;
-use serde_json::Value;
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
-use telemetry::{__InstrumentTrait, TelemetryContext, warn};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
+use telemetry::{__InstrumentTrait, warn};
+use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
@@ -31,47 +30,31 @@ pub enum HttpServerError {
 }
 
 pub struct HttpCall {
+    pub(crate) connection: Connection,
     request: HttpRequest,
-    response: Option<HttpResponse<HttpResponseBodyUnInitialized>>,
     extras: HashMap<String, String>,
     request_id: Uuid,
-    transport_slot: Arc<tokio::sync::Mutex<Option<Transport>>>,
 }
 
 impl HttpCall {
     async fn parse(
-        stream: Transport,
+        transport: Transport,
         request_id: Uuid,
         max_body_size: usize,
     ) -> Result<Self, (Transport, HttpRequestError)> {
-        let transport_slot: Arc<tokio::sync::Mutex<Option<Transport>>> =
-            Arc::new(tokio::sync::Mutex::new(None));
+        let mut connection = Connection::new(transport);
 
-        let mut reader = BufReader::new(stream);
-        let request = match HttpRequest::parse(&mut reader, max_body_size).await {
-            Ok(request) => request,
-            Err(err) => {
-                return Err((reader.into_inner(), err));
-            }
+        let request = match connection.read_request(max_body_size).await {
+            Ok(r) => r,
+            Err(e) => return Err((connection.into_transport(), e)),
         };
-        let http_version = request.http_version().clone();
+
         Ok(Self {
-            response: Some(HttpResponse::new(
-                reader.into_inner(),
-                http_version,
-                request_id,
-                Arc::from(request.route()),
-                transport_slot.clone(),
-            )),
+            connection,
             request,
             extras: HashMap::new(),
             request_id,
-            transport_slot,
         })
-    }
-
-    pub(crate) async fn take_transport(&self) -> Option<Transport> {
-        self.transport_slot.lock().await.take()
     }
 
     pub(crate) fn method(&self) -> &HttpMethod {
@@ -151,12 +134,21 @@ impl HttpCall {
         self.extras.remove(key)
     }
 
-    pub fn response(&mut self) -> HttpResponse<HttpResponseBodyUnInitialized> {
-        self.response.take().unwrap()
-    }
-
     pub(crate) fn response_sent(&self) -> bool {
-        self.response.is_none()
+        self.connection.has_written_response()
+    }
+}
+
+impl HttpCall {
+    pub fn response(&mut self) -> HttpResponseInit<'_> {
+        HttpResponseInit {
+            connection: &mut self.connection,
+            response: HttpResponse::new(
+                self.request.http_version().clone(),
+                self.request_id,
+                Arc::from(self.request.route()),
+            ),
+        }
     }
 }
 
@@ -233,74 +225,8 @@ pub struct HttpServer {
 }
 
 impl HttpServer {
-    async fn bind(port: u16, cors: Option<Cors>) -> Result<Self, HttpServerError> {
-        let addr = SocketAddr::from(([0, 0, 0, 0], port));
-        let listener = TcpListener::bind(addr)
-            .await
-            .map_err(|_| HttpServerError::AddrInUse(port))?;
-
-        Ok(Self {
-            routes: inventory::iter::<RouteFactory>()
-                .map(|f| (f.factory)())
-                .collect(),
-            listener,
-            active_requests: ActiveRequest::new(),
-            on_request_complete: None,
-            cors,
-            tls: None,
-            request_timeout: std::time::Duration::from_secs(60),
-            keep_alive_timeout: std::time::Duration::from_secs(75),
-            max_body_size: 10 * 1024 * 1024,
-        })
-    }
-
-    pub async fn new(port: u16, cors: Option<Cors>) -> Result<Self, HttpServerError> {
-        Ok(Self {
-            tls: None,
-            ..Self::bind(port, cors).await?
-        })
-    }
-
-    pub async fn new_tls(
-        port: u16,
-        cors: Option<Cors>,
-        tls_config: TlsConfig,
-    ) -> Result<Self, HttpServerError> {
-        rustls::crypto::aws_lc_rs::default_provider()
-            .install_default()
-            .expect("failed to install rustls crypto provider");
-        Ok(Self {
-            tls: Some(tls_config.build()?),
-            ..Self::bind(port, cors).await?
-        })
-    }
-
-    pub fn request_timeout(mut self, duration: std::time::Duration) -> Self {
-        self.request_timeout = duration;
-        self
-    }
-
-    pub fn keep_alive_timeout(mut self, duration: std::time::Duration) -> Self {
-        self.keep_alive_timeout = duration;
-        self
-    }
-
-    pub fn max_body_size(mut self, bytes: usize) -> Self {
-        self.max_body_size = bytes;
-        self
-    }
-
-    pub fn on_request_complete<F, Fut>(mut self, f: F) -> Self
-    where
-        F: Fn(RequestInfo) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
-    {
-        self.on_request_complete = Some(Arc::new(move |meta| Box::pin(f(meta))));
-        self
-    }
-
-    pub fn register_route(&mut self, route_definition: RouteDefinition) {
-        self.routes.push(route_definition);
+    pub fn builder(port: u16) -> HttpServerBuilder {
+        HttpServerBuilder::new(port)
     }
 
     pub async fn listen(self) {
@@ -369,12 +295,12 @@ impl HttpServer {
 
     async fn handle_single_request(
         &self,
-        stream: Transport,
+        transport: Transport,
         request_id: Uuid,
     ) -> Option<Transport> {
         let mut call: HttpCall = match tokio::time::timeout(
             self.request_timeout,
-            HttpCall::parse(stream, request_id, self.max_body_size),
+            HttpCall::parse(transport, request_id, self.max_body_size),
         )
         .await
         {
@@ -385,22 +311,18 @@ impl HttpServer {
                     _ => HttpStatusCode::BadRequest,
                 };
 
-                let slot = Arc::new(tokio::sync::Mutex::new(None));
-
-                HttpResponse::new(
-                    stream,
-                    Bytes::from_static(b"HTTP/1.1"),
-                    request_id,
-                    Arc::from(""),
-                    slot.clone(),
-                )
-                .status_code(status)
-                .send()
-                .await;
-
-                if let Some(mut t) = slot.lock().await.take() {
-                    let _ = t.shutdown().await;
-                }
+                let mut conn = Connection::new(stream);
+                let _ = conn
+                    .write_response(
+                        HttpResponse::new(
+                            Bytes::from_static(b"HTTP/1.1"),
+                            request_id,
+                            Arc::from(""),
+                        )
+                        .status_code(status),
+                    )
+                    .await;
+                let _ = conn.shutdown().await;
 
                 return None;
             }
@@ -412,38 +334,19 @@ impl HttpServer {
             .map(|v| !v.eq_ignore_ascii_case("close"))
             .unwrap_or(true);
 
-        if let Some(resp) = call.response.take() {
-            let resp = resp.__add_header_internal(
-                "connection",
-                if keep_alive { "keep-alive" } else { "close" },
-            );
-            let resp = if keep_alive {
-                resp.__add_header_internal(
-                    "keep-alive",
-                    format!("timeout={}", self.keep_alive_timeout.as_secs()),
-                )
-            } else {
-                resp
-            };
-            call.response = Some(resp);
-        }
-
         if let Some(cors) = &self.cors {
             if *call.method() == HttpMethod::OPTIONS {
                 cors.handle_preflight(&mut call).await;
-                // Get transport back from call after preflight response
                 return if keep_alive {
-                    call.take_transport().await
+                    Some(call.connection.into_transport())
                 } else {
+                    let _ = call.connection.shutdown().await;
                     None
                 };
-            } else if let Some(resp) = call.response.take() {
-                let resp_with_cors = cors.add_cors_headers(&call, resp);
-                call.response = Some(resp_with_cors);
             }
         }
 
-        let guard = self.active_requests.insert(
+        let _guard = self.active_requests.insert(
             request_id,
             RequestInfo::new(
                 request_id,
@@ -452,34 +355,7 @@ impl HttpServer {
             ),
         );
 
-        if let Some(resp) = call.response.take() {
-            let g = guard.clone();
-            let on_complete = self.on_request_complete.clone();
-            let hook: ResponseHook = Arc::new(move |status_code| {
-                g.update(|info| {
-                    info.set_response_status(status_code.clone());
-                    info.mark_as_end();
-                });
-                if let Some(on_request_complete) = &on_complete
-                    && let Some(info) = g.value()
-                {
-                    let fut = on_request_complete({
-                        let mut info = info.clone();
-                        info.set_response_status(status_code);
-                        info
-                    });
-                    telemetry::spawn!(fut);
-                }
-            });
-            call.response = Some(resp.set_on_set(hook));
-        }
-
         let is_head = *call.method() == HttpMethod::HEAD;
-        if is_head {
-            if let Some(resp) = call.response.take() {
-                call.response = Some(resp.suppress_body());
-            }
-        }
 
         let route = match self.routes.iter().find(|route| {
             let method_match = &route.method == call.request.method()
@@ -490,11 +366,14 @@ impl HttpServer {
             None => {
                 call.response()
                     .status_code(HttpStatusCode::NotFound)
+                    .empty()
                     .send()
                     .await;
+
                 return if keep_alive {
-                    call.take_transport().await
+                    Some(call.connection.into_transport())
                 } else {
+                    let _ = call.connection.shutdown().await;
                     None
                 };
             }
@@ -502,29 +381,119 @@ impl HttpServer {
 
         call.request.parse_params(&route.route);
 
-        if !route.middleware.is_empty() {
-            for middleware in route.middleware.iter() {
-                middleware(&mut call).await;
-                if call.response_sent() {
-                    return if keep_alive {
-                        call.take_transport().await
-                    } else {
-                        None
-                    };
-                }
+        for middleware in route.middleware.iter() {
+            middleware(&mut call).await;
+            if call.response_sent() {
+                return if keep_alive {
+                    Some(call.connection.into_transport())
+                } else {
+                    let _ = call.connection.shutdown().await;
+                    None
+                };
             }
         }
 
         (route.handler)(&mut call).await;
 
         if keep_alive {
-            call.take_transport().await
+            Some(call.connection.into_transport())
         } else {
-            // Explicitly shut down — client said Connection: close
-            if let Some(mut transport) = call.take_transport().await {
-                let _ = transport.shutdown().await;
-            }
+            let _ = call.connection.shutdown().await;
             None
         }
+    }
+}
+
+pub struct HttpServerBuilder {
+    port: u16,
+    cors: Option<Cors>,
+    tls_config: Option<TlsConfig>,
+    request_timeout: std::time::Duration,
+    keep_alive_timeout: std::time::Duration,
+    max_body_size: usize,
+    on_request_complete: Option<OnRequestComplete>,
+    routes: Vec<RouteDefinition>,
+}
+
+impl HttpServerBuilder {
+    pub fn new(port: u16) -> Self {
+        Self {
+            port,
+            cors: None,
+            tls_config: None,
+            request_timeout: std::time::Duration::from_secs(60),
+            keep_alive_timeout: std::time::Duration::from_secs(75),
+            max_body_size: 10 * 1024 * 1024,
+            on_request_complete: None,
+            routes: inventory::iter::<RouteFactory>()
+                .map(|f| (f.factory)())
+                .collect(),
+        }
+    }
+
+    pub fn cors(mut self, cors: Cors) -> Self {
+        self.cors = Some(cors);
+        self
+    }
+
+    pub fn tls(mut self, tls_config: TlsConfig) -> Self {
+        self.tls_config = Some(tls_config);
+        self
+    }
+
+    pub fn request_timeout(mut self, duration: std::time::Duration) -> Self {
+        self.request_timeout = duration;
+        self
+    }
+
+    pub fn keep_alive_timeout(mut self, duration: std::time::Duration) -> Self {
+        self.keep_alive_timeout = duration;
+        self
+    }
+
+    pub fn max_body_size(mut self, bytes: usize) -> Self {
+        self.max_body_size = bytes;
+        self
+    }
+
+    pub fn on_request_complete<F, Fut>(mut self, f: F) -> Self
+    where
+        F: Fn(RequestInfo) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.on_request_complete = Some(Arc::new(move |meta| Box::pin(f(meta))));
+        self
+    }
+
+    pub fn route(mut self, route_definition: RouteDefinition) -> Self {
+        self.routes.push(route_definition);
+        self
+    }
+
+    pub async fn build(self) -> Result<HttpServer, HttpServerError> {
+        let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
+        let listener = TcpListener::bind(addr)
+            .await
+            .map_err(|_| HttpServerError::AddrInUse(self.port))?;
+
+        let tls = if let Some(tls_config) = self.tls_config {
+            // Use ok() so it doesn't panic if called multiple times in the same application
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            Some(tls_config.build()?)
+        } else {
+            None
+        };
+
+        Ok(HttpServer {
+            routes: self.routes,
+            listener,
+            active_requests: ActiveRequest::new(),
+            on_request_complete: self.on_request_complete,
+            cors: self.cors,
+            tls,
+            request_timeout: self.request_timeout,
+            keep_alive_timeout: self.keep_alive_timeout,
+            max_body_size: self.max_body_size,
+        })
     }
 }

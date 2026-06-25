@@ -90,6 +90,7 @@ impl Cors {
                 if is_preflight {
                     call.response()
                         .status_code(HttpStatusCode::NoContent)
+                        .empty()
                         .send()
                         .await;
                 }
@@ -104,6 +105,7 @@ impl Cors {
                     Err(_) => {
                         call.response()
                             .status_code(HttpStatusCode::NoContent)
+                            .empty()
                             .send()
                             .await;
                         return;
@@ -112,6 +114,7 @@ impl Cors {
                 None => {
                     call.response()
                         .status_code(HttpStatusCode::NoContent)
+                        .empty()
                         .send()
                         .await;
                     return;
@@ -121,11 +124,17 @@ impl Cors {
             if !self.allowed_methods.contains(&requested_method) {
                 call.response()
                     .status_code(HttpStatusCode::NoContent)
+                    .empty()
                     .send()
                     .await;
                 return;
             }
         }
+
+        let request_headers = call
+            .header("access-control-request-headers")
+            .unwrap_or_default()
+            .to_owned();
 
         let mut resp = if is_preflight {
             call.response().status_code(HttpStatusCode::NoContent)
@@ -153,9 +162,6 @@ impl Cors {
         resp = resp.__add_header_internal("access-control-allow-methods", methods_str);
 
         if is_preflight {
-            let request_headers = call
-                .header("access-control-request-headers")
-                .unwrap_or_default();
             let allow_headers = if self.allowed_headers.is_empty() {
                 if request_headers.is_empty() {
                     String::new()
@@ -193,7 +199,7 @@ impl Cors {
             );
         }
 
-        resp.send().await;
+        resp.empty().send().await;
     }
 }
 
