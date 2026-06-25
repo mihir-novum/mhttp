@@ -9,7 +9,7 @@ use std::fmt::{Display, Formatter};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 #[derive(thiserror::Error, Debug)]
 pub enum HttpRequestError {
@@ -25,6 +25,10 @@ pub enum HttpRequestError {
     InvalidHttpMethod(),
     #[error("payload too large")]
     PayloadTooLarge,
+    #[error("request line too long")]
+    RequestLineTooLong,
+    #[error("headers too large")]
+    HeadersTooLarge,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -168,6 +172,11 @@ impl HttpRequest {
                     "Stream closed before request line could be parsed".into(),
                 ));
             }
+
+            if buf.len() > 8192 {
+                return Err(HttpRequestError::RequestLineTooLong);
+            }
+
             match Self::parse_request_line(buf) {
                 Ok(v) => v,
                 Err(e) => {
@@ -197,6 +206,10 @@ impl HttpRequest {
                     ));
                 }
 
+                if buffer.len() > 64 * 1024 {
+                    return Err(HttpRequestError::HeadersTooLarge);
+                }
+
                 if buffer.ends_with(b"\r\n\r\n") {
                     break;
                 }
@@ -215,6 +228,37 @@ impl HttpRequest {
             .unwrap_or_default()
             .to_owned();
 
+        let content_length = field_lines
+            .get("content-length")
+            .unwrap_or("0")
+            .parse::<usize>()
+            .unwrap_or(0);
+
+        if field_lines
+            .get("expect")
+            .map(|v| v.eq_ignore_ascii_case("100-continue"))
+            .unwrap_or(false)
+        {
+            if content_length > max_body_size {
+                return Err(HttpRequestError::PayloadTooLarge);
+            }
+
+            // Confirm we'll accept the body
+            reader
+                .get_mut()
+                .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+                .await
+                .map_err(|e| {
+                    HttpRequestError::RequestParsingFailed(format!(
+                        "Failed to send 100 Continue: {e}"
+                    ))
+                })?;
+
+            reader.get_mut().flush().await.map_err(|e| {
+                HttpRequestError::RequestParsingFailed(format!("Failed to flush 100 Continue: {e}"))
+            })?;
+        }
+
         let is_chunked = field_lines
             .get("transfer-encoding")
             .map(|v| v.contains("chunked"))
@@ -231,12 +275,6 @@ impl HttpRequest {
                 }
             }
         } else {
-            let content_length = field_lines
-                .get("content-length")
-                .unwrap_or("0")
-                .parse::<usize>()
-                .unwrap();
-
             match Body::read_exact(reader, content_length, max_body_size, Some(content_type)).await
             {
                 Ok(v) => v,

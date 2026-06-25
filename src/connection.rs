@@ -1,7 +1,8 @@
+use crate::HttpStatusCode;
 use crate::body::Body;
 use crate::field_lines::FieldLines;
 use crate::request::{HttpRequest, HttpRequestError};
-use crate::response::HttpResponse;
+use crate::response::{HttpResponse, HttpResponseBodyInitialized};
 use crate::transport::Transport;
 use bytes::BytesMut;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
@@ -9,6 +10,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 pub(crate) struct Connection {
     transport: Transport,
     has_written_response: bool,
+    keep_alive: bool,
+    keep_alive_timeout_secs: u64,
 }
 
 impl Connection {
@@ -16,8 +19,16 @@ impl Connection {
         Self {
             transport,
             has_written_response: false,
+            keep_alive: true,
+            keep_alive_timeout_secs: 75,
         }
     }
+
+    pub(crate) fn set_keep_alive(&mut self, keep_alive: bool, timeout_secs: u64) {
+        self.keep_alive = keep_alive;
+        self.keep_alive_timeout_secs = timeout_secs;
+    }
+
     pub(crate) fn has_written_response(&self) -> bool {
         self.has_written_response
     }
@@ -31,9 +42,9 @@ impl Connection {
         HttpRequest::parse(&mut reader, peer_addr, max_body_size).await
     }
 
-    pub(crate) async fn write_response<S>(
+    pub(crate) async fn write_response(
         &mut self,
-        mut response: HttpResponse<S>,
+        mut response: HttpResponse<HttpResponseBodyInitialized>,
     ) -> Result<(), tokio::io::Error> {
         self.has_written_response = true;
 
@@ -44,7 +55,31 @@ impl Connection {
                 .to_string(),
         );
 
-        if response.body.is_none() && response.field_lines.get("content-length").is_none() {
+        response.field_lines.set(
+            "connection",
+            if self.keep_alive {
+                "keep-alive"
+            } else {
+                "close"
+            },
+        );
+
+        if self.keep_alive {
+            response.field_lines.set(
+                "keep-alive",
+                format!("timeout={}", self.keep_alive_timeout_secs),
+            );
+        }
+
+        let status_forbids_body = matches!(
+            response.status_code,
+            HttpStatusCode::NoContent | HttpStatusCode::NotModified
+        );
+
+        if !status_forbids_body
+            && response.body.is_none()
+            && response.field_lines.get("content-length").is_none()
+        {
             response.field_lines.set("content-length", "0");
         }
 
@@ -71,7 +106,8 @@ impl Connection {
         }
 
         self.transport.write_all(b"\r\n").await?;
-        if !response.suppress_body {
+
+        if !response.suppress_body && !status_forbids_body {
             self.write_body(response.body, &response.field_lines)
                 .await?;
         }

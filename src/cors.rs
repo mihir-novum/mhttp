@@ -1,5 +1,7 @@
+use crate::HttpStatusCode;
+use crate::request::HttpMethod;
 use crate::response::{HttpResponse, HttpResponseBodyUnInitialized};
-use crate::{HttpCall, HttpMethod, HttpStatusCode};
+use crate::server::HttpCall;
 use std::marker::PhantomData;
 use std::str::FromStr;
 
@@ -24,14 +26,17 @@ impl Cors {
         self.apply_cors(call, true).await;
     }
 
+    /// Apply CORS headers to a non-OPTIONS response.
+    /// Takes HttpResponse by value, returns it with headers added.
     pub fn add_cors_headers(
         &self,
         call: &HttpCall,
         resp: HttpResponse<HttpResponseBodyUnInitialized>,
     ) -> HttpResponse<HttpResponseBodyUnInitialized> {
-        let origin = call.header("origin");
+        // Extract origin before any borrow of resp
+        let origin = call.header("origin").map(|o| o.to_owned());
 
-        let allow_origin = match (&self.allowed_origin, origin) {
+        let allow_origin = match (&self.allowed_origin, origin.as_deref()) {
             (AllowedOrigin::Any, Some(o)) if self.allow_credentials => o.to_string(),
             (AllowedOrigin::Any, _) => "*".to_string(),
             (AllowedOrigin::Only(list), Some(o))
@@ -76,9 +81,18 @@ impl Cors {
     }
 
     async fn apply_cors(&self, call: &mut HttpCall, is_preflight: bool) {
-        let origin = call.header("origin");
+        // Extract all values we need from call BEFORE calling call.response()
+        // to avoid simultaneous mutable + immutable borrows
+        let origin = call.header("origin").map(|o| o.to_owned());
+        let request_method = call
+            .header("access-control-request-method")
+            .map(|o| o.to_owned());
+        let request_headers = call
+            .header("access-control-request-headers")
+            .unwrap_or_default()
+            .to_owned();
 
-        let allow_origin = match (&self.allowed_origin, origin) {
+        let allow_origin = match (&self.allowed_origin, origin.as_deref()) {
             (AllowedOrigin::Any, Some(o)) if self.allow_credentials => o.to_string(),
             (AllowedOrigin::Any, _) => "*".to_string(),
             (AllowedOrigin::Only(list), Some(o))
@@ -99,7 +113,7 @@ impl Cors {
         };
 
         if is_preflight {
-            let requested_method = match call.header("access-control-request-method") {
+            let requested_method = match request_method.as_deref() {
                 Some(val) => match HttpMethod::from_str(val) {
                     Ok(m) => m,
                     Err(_) => {
@@ -131,11 +145,7 @@ impl Cors {
             }
         }
 
-        let request_headers = call
-            .header("access-control-request-headers")
-            .unwrap_or_default()
-            .to_owned();
-
+        // Build response — all data already extracted above, no call borrows needed
         let mut resp = if is_preflight {
             call.response().status_code(HttpStatusCode::NoContent)
         } else {
@@ -166,14 +176,14 @@ impl Cors {
                 if request_headers.is_empty() {
                     String::new()
                 } else {
-                    request_headers.to_string()
+                    request_headers.clone()
                 }
             } else if self
                 .allowed_headers
                 .iter()
                 .any(|h| h.eq_ignore_ascii_case("*"))
             {
-                request_headers.to_string()
+                request_headers.clone()
             } else {
                 self.allowed_headers.join(",")
             };
@@ -202,6 +212,8 @@ impl Cors {
         resp.empty().send().await;
     }
 }
+
+// ── Builder ────────────────────────────────────────────────────────────────
 
 pub struct Any;
 pub struct Restricted<T>(PhantomData<T>);

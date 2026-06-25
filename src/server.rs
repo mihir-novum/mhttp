@@ -3,7 +3,9 @@ use crate::body::Body;
 use crate::connection::Connection;
 use crate::cors::Cors;
 use crate::request::{HttpRequest, HttpRequestError};
-use crate::response::{HttpResponse, HttpResponseInit, ResponseHook};
+use crate::response::{
+    HttpResponse, HttpResponseBodyUnInitialized, HttpResponseInit, ResponseHook,
+};
 use crate::route_definition::{RouteDefinition, RouteDefinitionError, RouteFactory};
 use crate::tls::{TlsConfig, TlsConfigError};
 use crate::transport::Transport;
@@ -32,7 +34,7 @@ pub enum HttpServerError {
 
 pub struct HttpCall {
     pub(crate) connection: Connection,
-    request: HttpRequest,
+    pub(crate) request: HttpRequest,
     extras: HashMap<String, String>,
     request_id: Uuid,
     restart_tx: tokio::sync::mpsc::UnboundedSender<bool>,
@@ -105,25 +107,15 @@ impl HttpCall {
         self.request.body()
     }
 
-    pub fn path_param<K>(&self, param_name: K) -> Option<&str>
-    where
-        K: Into<String>,
-    {
+    pub fn path_param<K: Into<String>>(&self, param_name: K) -> Option<&str> {
         self.request.path_param(param_name)
     }
 
-    pub fn query_param<K>(&self, param_name: K) -> Option<&str>
-    where
-        K: Into<String>,
-    {
+    pub fn query_param<K: Into<String>>(&self, param_name: K) -> Option<&str> {
         self.request.query_param(param_name)
     }
 
-    pub fn set_extras<K, V>(&mut self, key: K, value: V)
-    where
-        K: Into<String>,
-        V: Into<String>,
-    {
+    pub fn set_extras<K: Into<String>, V: Into<String>>(&mut self, key: K, value: V) {
         match self
             .extras
             .entry(key.into().to_ascii_lowercase().trim().into())
@@ -149,9 +141,15 @@ impl HttpCall {
     pub(crate) fn response_sent(&self) -> bool {
         self.connection.has_written_response()
     }
-}
 
-impl HttpCall {
+    pub(crate) fn set_response_hook(&mut self, hook: ResponseHook) {
+        self.response_hook = Some(hook);
+    }
+
+    pub(crate) fn set_suppress_body(&mut self) {
+        self.suppress_body = true;
+    }
+
     pub fn response(&mut self) -> HttpResponseInit<'_> {
         let mut response = HttpResponse::new(
             self.request.http_version().clone(),
@@ -172,15 +170,9 @@ impl HttpCall {
             response,
         }
     }
-
-    pub(crate) fn set_response_hook(&mut self, hook: ResponseHook) {
-        self.response_hook = Some(hook);
-    }
-
-    pub(crate) fn set_suppress_body(&mut self) {
-        self.suppress_body = true;
-    }
 }
+
+// ── RequestInfo ────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
 pub struct RequestInfo {
@@ -207,23 +199,18 @@ impl RequestInfo {
     pub fn id(&self) -> &Uuid {
         &self.id
     }
-
     pub fn method(&self) -> &HttpMethod {
         &self.method
     }
-
     pub fn route(&self) -> &str {
         self.route.as_ref()
     }
-
     pub fn response_status(&self) -> Option<HttpStatusCode> {
         self.response_status.clone()
     }
-
     pub fn started_at(&self) -> chrono::DateTime<chrono::Utc> {
         self.started_at
     }
-
     pub fn ended_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         self.ended_at
     }
@@ -241,6 +228,8 @@ pub type ActiveRequest = ActiveSet<Uuid, RequestInfo>;
 
 type OnRequestComplete =
     Arc<dyn Fn(RequestInfo) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+// ── HttpServer ─────────────────────────────────────────────────────────────
 
 pub struct HttpServer {
     routes: Vec<RouteDefinition>,
@@ -263,26 +252,18 @@ impl HttpServer {
         let listener = self.listener.take().expect("Listener must be initialized");
         let server = Arc::new(self);
 
-        // Channel for programmatic restart triggers (from your route handlers)
         let (restart_tx, mut restart_rx) = tokio::sync::mpsc::unbounded_channel::<bool>();
-
-        // Channel for the background task to report if the new process lived or died
         let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel::<Result<bool, ()>>();
 
         let mut thread_pool: JoinSet<()> = JoinSet::new();
-
-        // Lock to prevent multiple spawn attempts running at the exact same time
         let mut restart_in_progress = false;
 
-        // Docker SIGTERM listener
         #[cfg(unix)]
         let mut sigterm =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
 
-        // Loop-as-expression: break produces the `force` bool directly, no Option needed.
         let force: bool = loop {
             tokio::select! {
-                // 1. Keep accepting connections seamlessly!
                 Ok((stream, _)) = listener.accept() => {
                     let server_clone = server.clone();
                     let restart_tx = restart_tx.clone();
@@ -297,127 +278,119 @@ impl HttpServer {
                             Some(acceptor) => {
                                 match acceptor.accept(stream).await {
                                     Ok(tls_stream) => {
-                                        let peer_addr = tls_stream.get_ref().0.peer_addr().unwrap();
+                                        let peer_addr =
+                                            tls_stream.get_ref().0.peer_addr().unwrap();
                                         Transport::new(tls_stream, peer_addr)
                                     }
                                     Err(e) => {
-                                        println!("TLS error: {}", e);
+                                        telemetry::warn!("TLS error: {}", e);
                                         return;
                                     }
                                 }
                             }
                         };
 
-                        // One task per connection, many requests per connection
-                        server_clone.handle_connection(transport, restart_tx).await;
+                        server_clone
+                            .handle_connection(transport, restart_tx)
+                            .await;
                     }.instrument(context));
                 }
 
-                // 2. A restart is triggered from a route handler
                 Some(force) = restart_rx.recv() => {
-                    // Check the lock: if we are already restarting, discard duplicate requests
                     if restart_in_progress {
-                        println!("Restart already in progress. Ignoring duplicate request.");
+                        telemetry::info!("Restart already in progress, ignoring duplicate.");
                         continue;
                     }
 
-                    restart_in_progress = true; // Lock it!
-                    println!("Program restart triggered! Force: {}", force);
+                    restart_in_progress = true;
+                    telemetry::info!("Restart triggered. Force: {}", force);
 
                     let mut current_exe = match std::env::current_exe() {
                         Ok(exe) => exe,
                         Err(e) => {
-                            println!("Failed to get executable path: {}", e);
-                            restart_in_progress = false; // Unlock on failure
+                            telemetry::warn!("Failed to get executable path: {}", e);
+                            restart_in_progress = false;
                             continue;
                         }
                     };
 
                     if !current_exe.exists() {
-                        let argv0 = std::env::args().next().unwrap();
-                        current_exe = std::path::PathBuf::from(argv0);
+                        current_exe =
+                            std::path::PathBuf::from(std::env::args().next().unwrap());
                     }
 
-                    println!("Spawning new process: {}", current_exe.display());
+                    let mut child =
+                        match std::process::Command::new(&current_exe)
+                            .args(std::env::args().skip(1))
+                            .spawn()
+                        {
+                            Ok(c) => c,
+                            Err(e) => {
+                                telemetry::warn!("Failed to spawn new process: {}", e);
+                                restart_in_progress = false;
+                                continue;
+                            }
+                        };
 
-                    let mut child = match std::process::Command::new(current_exe)
-                        .args(std::env::args().skip(1))
-                        .spawn()
-                    {
-                        Ok(c) => c,
-                        Err(e) => {
-                            println!("Failed to spawn new process: {}", e);
-                            restart_in_progress = false; // Unlock on failure
-                            continue;
-                        }
-                    };
-
-                    telemetry::info!("New process spawned (PID {}). Verifying stability in background...", child.id());
+                    telemetry::info!(
+                        "New process spawned (PID {}). Verifying stability...",
+                        child.id()
+                    );
 
                     let result_tx = result_tx.clone();
-
-                    // BACKGROUND stability check (does not block accept loop!)
                     tokio::spawn(async move {
                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
                         if let Ok(Some(status)) = child.try_wait() {
-                            println!("New instance crashed with status: {}.", status);
-                            let _ = result_tx.send(Err(())); // Send Failure
+                            telemetry::warn!("New instance crashed: {}", status);
+                            let _ = result_tx.send(Err(()));
                         } else {
-                            let _ = result_tx.send(Ok(force)); // Send Success
+                            let _ = result_tx.send(Ok(force));
                         }
                     });
                 }
 
-                // 3. Background stability check result received
                 Some(result) = result_rx.recv() => {
                     match result {
                         Ok(force) => {
-                            println!("New instance is stable. Old instance handing over traffic.");
-                            break force; // Loop produces the force value
+                            telemetry::info!("New instance stable. Handing over.");
+                            break force;
                         }
                         Err(_) => {
-                            println!("Restart failed. Unlocking for future restart attempts.");
-                            // Unlock so developers can try fixing the code/config and hit /restart again!
+                            telemetry::warn!("Restart failed. Unlocking for future attempts.");
                             restart_in_progress = false;
                         }
                     }
                 }
 
-                // 4. Docker / Manual SIGINT (Ctrl+C)
                 _ = tokio::signal::ctrl_c() => {
-                    println!("Received Ctrl+C (SIGINT). Initiating graceful shutdown...");
-                    break false; // Always graceful for OS signals
+                    telemetry::info!("SIGINT received. Graceful shutdown.");
+                    break false;
                 }
 
-                // 5. Docker / Kubernetes SIGTERM
                 _ = async {
-                        #[cfg(unix)]
-                        sigterm.recv().await;
-                        #[cfg(not(unix))]
-                        std::future::pending::<()>().await;
-                    } => {
-                        println!("Received SIGTERM from Docker/Kubernetes. Initiating graceful shutdown...");
-                        break false; // Always graceful for OS signals
-                    }
+                    #[cfg(unix)]
+                    sigterm.recv().await;
+                    #[cfg(not(unix))]
+                    std::future::pending::<()>().await;
+                } => {
+                    telemetry::info!("SIGTERM received. Graceful shutdown.");
+                    break false;
+                }
             }
         };
 
-        // --- Server Shutdown Phase ---
-        // Drop the listener. In Docker, the Load Balancer spots this.
-        // In Bare-Metal, the OS instantly reroutes 100% of new traffic to the new PID.
         drop(listener);
 
         if force {
-            println!("Force flag provided. Aborting active tasks...");
+            telemetry::info!("Force shutdown. Aborting active tasks.");
             thread_pool.abort_all();
         } else {
-            println!("Graceful shutdown. Waiting for active tasks to finish...");
-            // Uses the `Notify` ActiveSet implementation
+            telemetry::info!("Graceful shutdown. Waiting for active requests.");
             server.active_requests.wait_for_zero().await;
+            thread_pool.join_all().await;
         }
 
-        println!("Old instance shutdown complete.");
+        telemetry::info!("Shutdown complete.");
         std::process::exit(0);
     }
 
@@ -431,11 +404,11 @@ impl HttpServer {
 
             match tokio::time::timeout(
                 self.keep_alive_timeout,
-                self.handle_single_request(transport, request_id, restart_tx.clone()), // Pass tx
+                self.handle_single_request(transport, request_id, restart_tx.clone()),
             )
             .await
             {
-                Ok(Some(returned_transport)) => transport = returned_transport,
+                Ok(Some(returned)) => transport = returned,
                 Ok(None) | Err(_) => break,
             }
         }
@@ -447,7 +420,8 @@ impl HttpServer {
         request_id: Uuid,
         restart_tx: tokio::sync::mpsc::UnboundedSender<bool>,
     ) -> Option<Transport> {
-        let mut call: HttpCall = match tokio::time::timeout(
+        // ── Parse ──────────────────────────────────────────────────────
+        let mut call = match tokio::time::timeout(
             self.request_timeout,
             HttpCall::parse(transport, request_id, self.max_body_size, restart_tx),
         )
@@ -457,9 +431,12 @@ impl HttpServer {
             Ok(Err((stream, err))) => {
                 let status = match err {
                     HttpRequestError::PayloadTooLarge => HttpStatusCode::ContentTooLarge,
+                    HttpRequestError::RequestLineTooLong => HttpStatusCode::UriTooLong,
+                    HttpRequestError::HeadersTooLarge => {
+                        HttpStatusCode::RequestHeaderFieldsTooLarge
+                    }
                     _ => HttpStatusCode::BadRequest,
                 };
-
                 let mut conn = Connection::new(stream);
                 let _ = conn
                     .write_response(
@@ -468,33 +445,34 @@ impl HttpServer {
                             request_id,
                             Arc::from(""),
                         )
-                        .status_code(status),
+                        .status_code(status)
+                        .empty(),
                     )
                     .await;
                 let _ = conn.shutdown().await;
-
                 return None;
             }
             Err(_) => return None,
         };
 
+        // ── Keep-alive ─────────────────────────────────────────────────
         let keep_alive = call
             .header("connection")
             .map(|v| !v.eq_ignore_ascii_case("close"))
             .unwrap_or(true);
 
+        call.connection
+            .set_keep_alive(keep_alive, self.keep_alive_timeout.as_secs());
+
+        // ── CORS ───────────────────────────────────────────────────────
         if let Some(cors) = &self.cors {
             if *call.method() == HttpMethod::OPTIONS {
                 cors.handle_preflight(&mut call).await;
-                return if keep_alive {
-                    Some(call.connection.into_transport())
-                } else {
-                    let _ = call.connection.shutdown().await;
-                    None
-                };
+                return self.finish(call.connection, keep_alive).await;
             }
         }
 
+        // ── Active request tracking ────────────────────────────────────
         let guard = self.active_requests.insert(
             request_id,
             RequestInfo::new(
@@ -504,10 +482,11 @@ impl HttpServer {
             ),
         );
 
+        // ── Response hook (telemetry / on_request_complete) ────────────
         {
             let g = guard.clone();
             let on_complete = self.on_request_complete.clone();
-            let hook: ResponseHook = Arc::new(move |status_code| {
+            call.set_response_hook(Arc::new(move |status_code| {
                 g.update(|info| {
                     info.set_response_status(status_code.clone());
                     info.mark_as_end();
@@ -522,16 +501,16 @@ impl HttpServer {
                     });
                     telemetry::spawn!(fut);
                 }
-            });
-            call.set_response_hook(hook);
+            }));
         }
 
+        // ── HEAD suppression ───────────────────────────────────────────
         let is_head = *call.method() == HttpMethod::HEAD;
-
         if is_head {
             call.set_suppress_body();
         }
 
+        // ── Route matching ─────────────────────────────────────────────
         let route = match self.routes.iter().find(|route| {
             let method_match = &route.method == call.request.method()
                 || (is_head && route.method == HttpMethod::GET);
@@ -539,45 +518,63 @@ impl HttpServer {
         }) {
             Some(route) => route,
             None => {
-                call.response()
-                    .status_code(HttpStatusCode::NotFound)
-                    .empty()
-                    .send()
+                // Apply CORS headers even on 404
+                let resp = self.apply_cors_to_uninit(
+                    &call,
+                    HttpResponse::new(
+                        call.request.http_version().clone(),
+                        request_id,
+                        Arc::from(call.request.route()),
+                    ),
+                );
+                let _ = call
+                    .connection
+                    .write_response(resp.status_code(HttpStatusCode::NotFound).empty())
                     .await;
-
-                return if keep_alive {
-                    Some(call.connection.into_transport())
-                } else {
-                    let _ = call.connection.shutdown().await;
-                    None
-                };
+                return self.finish(call.connection, keep_alive).await;
             }
         };
 
         call.request.parse_params(&route.route);
 
+        // ── Middleware ─────────────────────────────────────────────────
         for middleware in route.middleware.iter() {
             middleware(&mut call).await;
             if call.response_sent() {
-                return if keep_alive {
-                    Some(call.connection.into_transport())
-                } else {
-                    let _ = call.connection.shutdown().await;
-                    None
-                };
+                return self.finish(call.connection, keep_alive).await;
             }
         }
 
+        // ── Handler ────────────────────────────────────────────────────
         (route.handler)(&mut call).await;
 
+        self.finish(call.connection, keep_alive).await
+    }
+
+    /// Apply CORS headers to an uninit response for non-OPTIONS requests.
+    fn apply_cors_to_uninit(
+        &self,
+        call: &HttpCall,
+        resp: HttpResponse<HttpResponseBodyUnInitialized>,
+    ) -> HttpResponse<HttpResponseBodyUnInitialized> {
+        match &self.cors {
+            Some(cors) => cors.add_cors_headers(call, resp),
+            None => resp,
+        }
+    }
+
+    /// Return transport for keep-alive or shut down cleanly.
+    async fn finish(&self, mut connection: Connection, keep_alive: bool) -> Option<Transport> {
         if keep_alive {
-            Some(call.connection.into_transport())
+            Some(connection.into_transport())
         } else {
-            let _ = call.connection.shutdown().await;
+            let _ = connection.shutdown().await;
             None
         }
     }
 }
+
+// ── HttpServerBuilder ──────────────────────────────────────────────────────
 
 pub struct HttpServerBuilder {
     port: u16,
@@ -657,7 +654,7 @@ impl HttpServerBuilder {
             .map_err(|_| HttpServerError::AddrInUse(self.port))?;
 
         socket.set_reuse_address(true).unwrap_or(());
-        #[cfg(any(target_family = "unix"))]
+        #[cfg(target_family = "unix")]
         socket.set_reuse_port(true).unwrap_or(());
 
         socket
@@ -669,11 +666,10 @@ impl HttpServerBuilder {
         socket.set_nonblocking(true).unwrap_or(());
 
         let std_listener: std::net::TcpListener = socket.into();
-        let listener = tokio::net::TcpListener::from_std(std_listener)
+        let listener = TcpListener::from_std(std_listener)
             .map_err(|_| HttpServerError::AddrInUse(self.port))?;
 
         let tls = if let Some(tls_config) = self.tls_config {
-            // Use ok() so it doesn't panic if called multiple times in the same application
             let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
             Some(tls_config.build()?)
         } else {

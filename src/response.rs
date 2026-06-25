@@ -43,6 +43,9 @@ pub enum HttpStatusCode {
     BadGateWay,
     ServiceUnavailable,
     ContentTooLarge,
+    UriTooLong,
+    RequestHeaderFieldsTooLarge,
+    NotModified,
 }
 
 impl HttpStatusCode {
@@ -52,11 +55,16 @@ impl HttpStatusCode {
             HttpStatusCode::Created => Bytes::from("201 Created"),
             HttpStatusCode::Accepted => Bytes::from("202 Accepted"),
             HttpStatusCode::NoContent => Bytes::from("204 No Content"),
+            HttpStatusCode::NotModified => Bytes::from("304 Not Modified"),
             HttpStatusCode::BadRequest => Bytes::from("400 Bad Request"),
             HttpStatusCode::Unauthorized => Bytes::from("401 Unauthorized"),
             HttpStatusCode::Forbidden => Bytes::from("403 Forbidden"),
             HttpStatusCode::NotFound => Bytes::from("404 Not Found"),
             HttpStatusCode::ContentTooLarge => Bytes::from("413 Content Too Large"),
+            HttpStatusCode::UriTooLong => Bytes::from("414 URI Too Long"),
+            HttpStatusCode::RequestHeaderFieldsTooLarge => {
+                Bytes::from("431 Request Header Fields Too Large")
+            }
             HttpStatusCode::InternalServerError => Bytes::from("500 Internal Server Error"),
             HttpStatusCode::NotImplemented => Bytes::from("501 Not Implemented"),
             HttpStatusCode::BadGateWay => Bytes::from("502 Bad Gateway"),
@@ -72,11 +80,14 @@ impl From<HttpStatusCode> for u16 {
             HttpStatusCode::Created => 201,
             HttpStatusCode::Accepted => 202,
             HttpStatusCode::NoContent => 204,
+            HttpStatusCode::NotModified => 304,
             HttpStatusCode::BadRequest => 400,
             HttpStatusCode::Unauthorized => 401,
             HttpStatusCode::Forbidden => 403,
             HttpStatusCode::NotFound => 404,
             HttpStatusCode::ContentTooLarge => 413,
+            HttpStatusCode::UriTooLong => 414,
+            HttpStatusCode::RequestHeaderFieldsTooLarge => 431,
             HttpStatusCode::InternalServerError => 500,
             HttpStatusCode::NotImplemented => 501,
             HttpStatusCode::BadGateWay => 502,
@@ -99,8 +110,10 @@ pub struct HttpResponse<State> {
     pub(crate) cookies: Option<CookieStore>,
     pub(crate) suppress_body: bool,
     pub(crate) on_sent: Option<ResponseHook>,
-    _state: std::marker::PhantomData<State>,
+    pub(crate) _state: std::marker::PhantomData<State>,
 }
+
+// ── Construction ───────────────────────────────────────────────────────────
 
 impl HttpResponse<HttpResponseBodyUnInitialized> {
     pub(crate) fn new<B: Into<Bytes>>(http_version: B, request_id: Uuid, path: Arc<str>) -> Self {
@@ -108,8 +121,8 @@ impl HttpResponse<HttpResponseBodyUnInitialized> {
         field_lines.set("x-request-id", request_id.to_string());
 
         Self {
-            path,
             http_version: http_version.into(),
+            path,
             status_code: HttpStatusCode::Ok,
             body: None,
             field_lines,
@@ -119,7 +132,7 @@ impl HttpResponse<HttpResponseBodyUnInitialized> {
             _state: std::marker::PhantomData,
         }
     }
-    
+
     fn into_initialized(self, body: Option<Body>) -> HttpResponse<HttpResponseBodyInitialized> {
         HttpResponse {
             http_version: self.http_version,
@@ -134,16 +147,16 @@ impl HttpResponse<HttpResponseBodyUnInitialized> {
         }
     }
 
+    // ── body initializers ──────────────────────────────────────────────
+
     pub fn json<V: serde::Serialize>(
         mut self,
         value: V,
     ) -> HttpResponse<HttpResponseBodyInitialized> {
         let json_bytes = Bytes::from(serde_json::to_vec(&value).unwrap());
-
         self.field_lines.set("content-type", "application/json");
         self.field_lines
             .set("content-length", json_bytes.len().to_string());
-
         self.into_initialized(Some(Body::from(
             &json_bytes,
             Some("application/json".to_owned()),
@@ -157,11 +170,9 @@ impl HttpResponse<HttpResponseBodyUnInitialized> {
     ) -> HttpResponse<HttpResponseBodyInitialized> {
         let bytes = bytes.into();
         let content_type = content_type.into();
-
         self.field_lines.set("content-type", content_type.clone());
         self.field_lines
             .set("content-length", bytes.len().to_string());
-
         self.into_initialized(Some(Body::from(&bytes, Some(content_type))))
     }
 
@@ -172,11 +183,9 @@ impl HttpResponse<HttpResponseBodyUnInitialized> {
         content_type: C,
     ) -> HttpResponse<HttpResponseBodyInitialized> {
         let content_type = content_type.into();
-
         self.field_lines.set("content-type", content_type.clone());
         self.field_lines
             .set("content-length", content_len.to_string());
-
         self.into_initialized(Some(Body::from_stream(
             reader,
             content_len,
@@ -189,25 +198,34 @@ impl HttpResponse<HttpResponseBodyUnInitialized> {
     }
 }
 
+// ── Compress (initialized only) ────────────────────────────────────────────
+
 impl HttpResponse<HttpResponseBodyInitialized> {
     pub async fn compress(mut self) -> Self {
         let Some(body) = self.body.take() else {
             return self;
         };
 
-        let content_type = self.field_lines.get("content-type").unwrap_or_default();
+        let content_type = self
+            .field_lines
+            .get("content-type")
+            .unwrap_or_default()
+            .to_owned();
 
-        if !Compress::is_compressible(content_type) {
+        if !Compress::is_compressible(&content_type) {
             self.body = Some(body);
             return self;
         }
 
-        let accept_encoding = self.field_lines.get("accept-encoding").unwrap_or("");
+        let accept_encoding = self
+            .field_lines
+            .get("accept-encoding")
+            .unwrap_or("")
+            .to_owned();
 
         let encoding = if accept_encoding.contains("zstd") {
             "zstd"
         } else if accept_encoding.contains("br") {
-            // brotli is usually preferred over gzip
             "br"
         } else if accept_encoding.contains("gzip") {
             "gzip"
@@ -247,7 +265,6 @@ impl HttpResponse<HttpResponseBodyInitialized> {
                 self.field_lines
                     .set("content-length", compressed.len().to_string());
                 self.field_lines.set("vary", "Accept-Encoding");
-
                 self.body = Some(Body::Bytes {
                     bytes: Bytes::from(compressed),
                     content_type: ct,
@@ -283,6 +300,8 @@ impl HttpResponse<HttpResponseBodyInitialized> {
         self
     }
 }
+
+// ── Shared methods (both states) ───────────────────────────────────────────
 
 impl<State> HttpResponse<State> {
     pub fn status_code(mut self, status_code: HttpStatusCode) -> Self {
@@ -359,25 +378,7 @@ impl<State> HttpResponse<State> {
     }
 }
 
-pub struct HttpResponseReady<'a> {
-    pub(crate) connection: &'a mut Connection,
-    pub(crate) response: HttpResponse<HttpResponseBodyInitialized>,
-}
-
-impl<'a> HttpResponseReady<'a> {
-    pub async fn compress(mut self) -> Self {
-        self.response = self.response.compress().await;
-        self
-    }
-
-    pub async fn failable_send(self) -> Result<(), tokio::io::Error> {
-        self.connection.write_response(self.response).await
-    }
-
-    pub async fn send(self) {
-        let _ = self.failable_send().await;
-    }
-}
+// ── HttpResponseInit — uninit handle, captures &mut Connection ────────────
 
 pub struct HttpResponseInit<'a> {
     pub(crate) connection: &'a mut Connection,
@@ -429,6 +430,8 @@ impl<'a> HttpResponseInit<'a> {
         self
     }
 
+    // ── body methods — transition to HttpResponseReady ─────────────────
+
     pub fn json<V: serde::Serialize>(self, value: V) -> HttpResponseReady<'a> {
         HttpResponseReady {
             connection: self.connection,
@@ -460,5 +463,37 @@ impl<'a> HttpResponseInit<'a> {
             connection: self.connection,
             response: self.response.empty(),
         }
+    }
+}
+
+// ── HttpResponseReady — init handle, only send() ──────────────────────────
+
+pub struct HttpResponseReady<'a> {
+    pub(crate) connection: &'a mut Connection,
+    pub(crate) response: HttpResponse<HttpResponseBodyInitialized>,
+}
+
+impl<'a> HttpResponseReady<'a> {
+    pub fn status_code(mut self, code: HttpStatusCode) -> Self {
+        self.response = self.response.status_code(code);
+        self
+    }
+
+    pub fn add_header<K: Into<String>, V: Into<String>>(mut self, k: K, v: V) -> Self {
+        self.response = self.response.add_header(k, v);
+        self
+    }
+
+    pub async fn compress(mut self) -> Self {
+        self.response = self.response.compress().await;
+        self
+    }
+
+    pub async fn failable_send(self) -> Result<(), tokio::io::Error> {
+        self.connection.write_response(self.response).await
+    }
+
+    pub async fn send(self) {
+        let _ = self.failable_send().await;
     }
 }
