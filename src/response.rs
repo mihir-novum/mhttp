@@ -46,6 +46,7 @@ pub enum HttpStatusCode {
     UriTooLong,
     RequestHeaderFieldsTooLarge,
     NotModified,
+    MethodNotAllowed
 }
 
 impl HttpStatusCode {
@@ -60,6 +61,7 @@ impl HttpStatusCode {
             HttpStatusCode::Unauthorized => Bytes::from("401 Unauthorized"),
             HttpStatusCode::Forbidden => Bytes::from("403 Forbidden"),
             HttpStatusCode::NotFound => Bytes::from("404 Not Found"),
+            HttpStatusCode::MethodNotAllowed => Bytes::from("405 Method Not Allowed"),
             HttpStatusCode::ContentTooLarge => Bytes::from("413 Content Too Large"),
             HttpStatusCode::UriTooLong => Bytes::from("414 URI Too Long"),
             HttpStatusCode::RequestHeaderFieldsTooLarge => {
@@ -85,6 +87,7 @@ impl From<HttpStatusCode> for u16 {
             HttpStatusCode::Unauthorized => 401,
             HttpStatusCode::Forbidden => 403,
             HttpStatusCode::NotFound => 404,
+            HttpStatusCode::MethodNotAllowed => 405,
             HttpStatusCode::ContentTooLarge => 413,
             HttpStatusCode::UriTooLong => 414,
             HttpStatusCode::RequestHeaderFieldsTooLarge => 431,

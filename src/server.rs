@@ -678,8 +678,15 @@ impl HttpServer {
         }) {
             Some(route) => route,
             None => {
-                // Apply CORS headers even on 404
-                let resp = self.apply_cors_to_uninit(
+                let mut allowed_methods = Vec::new();
+
+                for route in &self.routes {
+                    if route.route.is_match(call.request.route()) {
+                        allowed_methods.push(route.method.to_string());
+                    }
+                }
+
+                let mut resp = self.apply_cors_to_uninit(
                     &call,
                     HttpResponse::new(
                         call.request.http_version().clone(),
@@ -687,10 +694,23 @@ impl HttpServer {
                         Arc::from(call.request.route()),
                     ),
                 );
-                let _ = call
-                    .connection
-                    .write_response(resp.status_code(HttpStatusCode::NotFound).empty())
-                    .await;
+
+                if allowed_methods.is_empty() {
+                    resp = resp.status_code(HttpStatusCode::NotFound);
+                } else {
+                    if allowed_methods.iter().any(|m| m == "GET")
+                        && !allowed_methods.iter().any(|m| m == "HEAD")
+                    {
+                        allowed_methods.push("HEAD".to_string());
+                    }
+
+                    resp = resp
+                        .status_code(HttpStatusCode::MethodNotAllowed)
+                        .add_header("allow", allowed_methods.join(", "));
+                }
+
+                let _ = call.connection.write_response(resp.empty()).await;
+
                 return self.finish(call.connection, keep_alive).await;
             }
         };
