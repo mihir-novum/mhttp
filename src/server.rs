@@ -77,16 +77,22 @@ impl HttpCall {
         transport: Transport,
         request_id: Uuid,
         max_body_size: usize,
+        keep_alive_timeout: std::time::Duration,
+        request_timeout: std::time::Duration,
         restart_handle: RestartHandle,
-    ) -> Result<Self, (Transport, HttpRequestError)> {
+    ) -> Result<Option<Self>, (Transport, HttpRequestError)> {
         let mut connection = Connection::new(transport);
 
-        let request = match connection.read_request(max_body_size).await {
-            Ok(r) => r,
+        let request = match connection
+            .read_request(max_body_size, keep_alive_timeout, request_timeout)
+            .await
+        {
+            Ok(Some(r)) => r,
+            Ok(None) => return Ok(None), // Client disconnected cleanly while idle
             Err(e) => return Err((connection.into_transport(), e)),
         };
 
-        Ok(Self {
+        Ok(Some(Self {
             connection,
             request,
             extras: HashMap::new(),
@@ -94,7 +100,7 @@ impl HttpCall {
             restart_handle,
             response_hook: None,
             suppress_body: false,
-        })
+        }))
     }
 
     pub(crate) fn method(&self) -> &HttpMethod {
@@ -562,14 +568,12 @@ impl HttpServer {
         loop {
             let request_id = Uuid::new_v4();
 
-            match tokio::time::timeout(
-                self.keep_alive_timeout,
-                self.handle_single_request(transport, request_id, restart_handle.clone()),
-            )
-            .await
+            match self
+                .handle_single_request(transport, request_id, restart_handle.clone())
+                .await
             {
-                Ok(Some(returned)) => transport = returned,
-                Ok(None) | Err(_) => break,
+                Some(returned) => transport = returned,
+                None => break,
             }
         }
     }
@@ -581,23 +585,35 @@ impl HttpServer {
         restart_handle: RestartHandle,
     ) -> Option<Transport> {
         // ── Parse ──────────────────────────────────────────────────────
-        let mut call = match tokio::time::timeout(
+        let mut call: HttpCall = match HttpCall::parse(
+            transport,
+            request_id,
+            self.max_body_size,
+            self.keep_alive_timeout,
             self.request_timeout,
-            HttpCall::parse(transport, request_id, self.max_body_size, restart_handle),
+            restart_handle,
         )
         .await
         {
-            Ok(Ok(call)) => call,
-            Ok(Err((stream, err))) => {
+            Ok(Some(call)) => call,
+            Ok(None) => {
+                // Client sat idle for 75s and disconnected gracefully.
+                return None;
+            }
+            Err((stream, err)) => {
+                // Parse failed (Bad Request, Payload Too Large, Slowloris)
                 let status = match err {
                     HttpRequestError::PayloadTooLarge => HttpStatusCode::ContentTooLarge,
                     HttpRequestError::RequestLineTooLong => HttpStatusCode::UriTooLong,
                     HttpRequestError::HeadersTooLarge => {
                         HttpStatusCode::RequestHeaderFieldsTooLarge
                     }
+                    HttpRequestError::Timeout => HttpStatusCode::RequestTimeout,
                     _ => HttpStatusCode::BadRequest,
                 };
                 let mut conn = Connection::new(stream);
+                conn.set_keep_alive(false, 0);
+                
                 let _ = conn
                     .write_response(
                         HttpResponse::new(
@@ -612,7 +628,6 @@ impl HttpServer {
                 let _ = conn.shutdown().await;
                 return None;
             }
-            Err(_) => return None,
         };
 
         // ── Keep-alive ─────────────────────────────────────────────────

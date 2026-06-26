@@ -29,6 +29,10 @@ pub enum HttpRequestError {
     RequestLineTooLong,
     #[error("headers too large")]
     HeadersTooLarge,
+    #[error("io error: {0}")]
+    Io(tokio::io::Error),
+    #[error("request time out")]
+    Timeout,
 }
 
 #[derive(Debug, PartialEq, Clone)]

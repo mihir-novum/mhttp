@@ -5,7 +5,7 @@ use crate::request::{HttpRequest, HttpRequestError};
 use crate::response::{HttpResponse, HttpResponseBodyInitialized};
 use crate::transport::Transport;
 use bytes::BytesMut;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 pub(crate) struct Connection {
     transport: Transport,
@@ -36,10 +36,47 @@ impl Connection {
     pub(crate) async fn read_request(
         &mut self,
         max_body_size: usize,
-    ) -> Result<HttpRequest, HttpRequestError> {
+        keep_alive_timeout: std::time::Duration,
+        request_timeout: std::time::Duration,
+    ) -> Result<Option<HttpRequest>, HttpRequestError> {
         let peer_addr = self.transport.peer_addr();
         let mut reader = BufReader::new(&mut self.transport);
-        HttpRequest::parse(&mut reader, peer_addr, max_body_size).await
+
+        // =====================================================================
+        // STAGE 1: IDLE TIMEOUT (Keep-Alive)
+        // Wait for the client to send the first byte. `fill_buf` pulls data
+        // into the reader but does NOT consume it.
+        // =====================================================================
+        match tokio::time::timeout(keep_alive_timeout, reader.fill_buf()).await {
+            Ok(Ok(buf)) if buf.is_empty() => {
+                // EOF reached: Client cleanly closed the connection.
+                return Ok(None);
+            }
+            Ok(Ok(_)) => {
+                // Success: We see bytes! The client has started talking.
+            }
+            Ok(Err(e)) => return Err(HttpRequestError::Io(e)),
+            Err(_) => {
+                // Timeout: The client sat idle for 75 seconds. Close cleanly.
+                return Ok(None);
+            }
+        }
+
+        // =====================================================================
+        // STAGE 2: PARSE TIMEOUT (Request Timeout)
+        // The client is actively talking. Enforce a hard 60-second limit to
+        // parse the headers and body to prevent Slowloris attacks.
+        // =====================================================================
+        match tokio::time::timeout(
+            request_timeout,
+            HttpRequest::parse(&mut reader, peer_addr, max_body_size),
+        )
+        .await
+        {
+            Ok(Ok(req)) => Ok(Some(req)),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(HttpRequestError::Timeout),
+        }
     }
 
     pub(crate) async fn write_response(

@@ -1,5 +1,7 @@
 use crate::{HttpCall, HttpStatusCode};
 use std::path::Path;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncSeekExt;
 
 pub struct StaticFileOptions {
     pub dir: &'static str,
@@ -90,7 +92,7 @@ async fn serve_index(call: &mut HttpCall, base: &Path, index: Option<&'static st
 async fn serve_file(call: &mut HttpCall, path: &Path) {
     let mime = mime_from_path(path);
 
-    let file = match tokio::fs::File::open(path).await {
+    let mut file = match tokio::fs::File::open(path).await {
         Ok(f) => f,
         Err(_) => {
             call.response()
@@ -102,7 +104,6 @@ async fn serve_file(call: &mut HttpCall, path: &Path) {
         }
     };
 
-    // Stat the file to get content-length without reading it
     let metadata = match file.metadata().await {
         Ok(m) => m,
         Err(_) => {
@@ -115,8 +116,45 @@ async fn serve_file(call: &mut HttpCall, path: &Path) {
         }
     };
 
+    let file_len = metadata.len();
+
+    // -- BUG FIX: Handle HTTP Range Requests --
+    if let Some(range_header) = call.header("range") {
+        if range_header.starts_with("bytes=") {
+            let range_str = &range_header[6..];
+            let parts: Vec<&str> = range_str.split('-').collect();
+
+            let start: u64 = parts.first().unwrap_or(&"").parse().unwrap_or(0);
+            let end: u64 = parts
+                .get(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(file_len.saturating_sub(1)); // Default to end of file if not provided
+
+            if start <= end && end < file_len {
+                if let Ok(_) = file.seek(std::io::SeekFrom::Start(start)).await {
+                    let content_length = end - start + 1;
+
+                    call.response()
+                        .status_code(HttpStatusCode::PartialContent)
+                        .__add_header_internal(
+                            "content-range",
+                            format!("bytes {}-{}/{}", start, end, file_len),
+                        )
+                        .__add_header_internal("accept-ranges", "bytes")
+                        // Take only the requested chunk using AsyncReadExt::take
+                        .stream(file.take(content_length), content_length, mime)
+                        .send()
+                        .await;
+                    return;
+                }
+            }
+        }
+    }
+
+    // -- Normal full-file response --
     call.response()
-        .stream(file, metadata.len(), mime)
+        .add_header("accept-ranges", "bytes") // Tells the browser it CAN seek in the future
+        .stream(file, file_len, mime)
         .send()
         .await;
 }

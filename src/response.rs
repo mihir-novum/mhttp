@@ -25,6 +25,8 @@ const RESERVED_HEADERS: &[&str] = &[
     "date",
     "connection",
     "keep-alive",
+    "content-range",
+    "accept-ranges"
 ];
 
 #[derive(Debug, Clone)]
@@ -46,7 +48,9 @@ pub enum HttpStatusCode {
     UriTooLong,
     RequestHeaderFieldsTooLarge,
     NotModified,
-    MethodNotAllowed
+    MethodNotAllowed,
+    PartialContent,
+    RequestTimeout,
 }
 
 impl HttpStatusCode {
@@ -56,12 +60,14 @@ impl HttpStatusCode {
             HttpStatusCode::Created => Bytes::from("201 Created"),
             HttpStatusCode::Accepted => Bytes::from("202 Accepted"),
             HttpStatusCode::NoContent => Bytes::from("204 No Content"),
+            HttpStatusCode::PartialContent => Bytes::from("206 Partial Content"),
             HttpStatusCode::NotModified => Bytes::from("304 Not Modified"),
             HttpStatusCode::BadRequest => Bytes::from("400 Bad Request"),
             HttpStatusCode::Unauthorized => Bytes::from("401 Unauthorized"),
             HttpStatusCode::Forbidden => Bytes::from("403 Forbidden"),
             HttpStatusCode::NotFound => Bytes::from("404 Not Found"),
             HttpStatusCode::MethodNotAllowed => Bytes::from("405 Method Not Allowed"),
+            HttpStatusCode::RequestTimeout => Bytes::from("408 Request Timeout"),
             HttpStatusCode::ContentTooLarge => Bytes::from("413 Content Too Large"),
             HttpStatusCode::UriTooLong => Bytes::from("414 URI Too Long"),
             HttpStatusCode::RequestHeaderFieldsTooLarge => {
@@ -82,12 +88,14 @@ impl From<HttpStatusCode> for u16 {
             HttpStatusCode::Created => 201,
             HttpStatusCode::Accepted => 202,
             HttpStatusCode::NoContent => 204,
+            HttpStatusCode::PartialContent => 206,
             HttpStatusCode::NotModified => 304,
             HttpStatusCode::BadRequest => 400,
             HttpStatusCode::Unauthorized => 401,
             HttpStatusCode::Forbidden => 403,
             HttpStatusCode::NotFound => 404,
             HttpStatusCode::MethodNotAllowed => 405,
+            HttpStatusCode::RequestTimeout => 408,
             HttpStatusCode::ContentTooLarge => 413,
             HttpStatusCode::UriTooLong => 414,
             HttpStatusCode::RequestHeaderFieldsTooLarge => 431,
