@@ -32,12 +32,24 @@ pub enum HttpServerError {
     Tls(#[from] TlsConfigError),
 }
 
+pub struct RestartContext {
+    pub active_requests: Vec<RequestInfo>,
+}
+
+type RestartHook =
+    Box<dyn FnOnce(RestartContext) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
+
+pub(crate) struct RestartRequest {
+    pub(crate) force: bool,
+    pub(crate) pre_hook: RestartHook,
+}
+
 pub struct HttpCall {
     pub(crate) connection: Connection,
     pub(crate) request: HttpRequest,
     extras: HashMap<String, String>,
     request_id: Uuid,
-    restart_tx: tokio::sync::mpsc::UnboundedSender<bool>,
+    restart_tx: tokio::sync::mpsc::UnboundedSender<RestartRequest>,
     response_hook: Option<ResponseHook>,
     suppress_body: bool,
 }
@@ -47,7 +59,7 @@ impl HttpCall {
         transport: Transport,
         request_id: Uuid,
         max_body_size: usize,
-        restart_tx: tokio::sync::mpsc::UnboundedSender<bool>,
+        restart_tx: tokio::sync::mpsc::UnboundedSender<RestartRequest>,
     ) -> Result<Self, (Transport, HttpRequestError)> {
         let mut connection = Connection::new(transport);
 
@@ -71,8 +83,15 @@ impl HttpCall {
         self.request.method()
     }
 
-    pub fn restart(&self, force: bool) {
-        let _ = self.restart_tx.send(force);
+    pub fn restart<F, Fut>(&self, force: bool, pre_hook: F)
+    where
+        F: FnOnce(RestartContext) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let _ = self.restart_tx.send(RestartRequest {
+            force,
+            pre_hook: Box::new(move |ctx| Box::pin(pre_hook(ctx))),
+        });
     }
 
     pub fn client_ipv4_address(&self) -> Option<Ipv4Addr> {
@@ -240,6 +259,8 @@ pub struct HttpServer {
     tls: Option<TlsAcceptor>,
     request_timeout: std::time::Duration,
     keep_alive_timeout: std::time::Duration,
+    restart_stability_window: std::time::Duration,
+    restart_pre_hook_timeout: std::time::Duration,
     max_body_size: usize,
 }
 
@@ -252,11 +273,18 @@ impl HttpServer {
         let listener = self.listener.take().expect("Listener must be initialized");
         let server = Arc::new(self);
 
-        let (restart_tx, mut restart_rx) = tokio::sync::mpsc::unbounded_channel::<bool>();
-        let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel::<Result<bool, ()>>();
+        let (restart_tx, mut restart_rx) = tokio::sync::mpsc::unbounded_channel::<RestartRequest>();
+        let (result_tx, mut result_rx) =
+            tokio::sync::mpsc::unbounded_channel::<Result<RestartRequest, ()>>();
 
         let mut thread_pool: JoinSet<()> = JoinSet::new();
         let mut restart_in_progress = false;
+
+        // Bug 5 fix — stop accepting new connections during handover
+        let accepting = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+        // Bug 7 fix — track child PID to kill on SIGINT/SIGTERM during restart
+        let child_pid: Arc<std::sync::Mutex<Option<u32>>> = Arc::new(std::sync::Mutex::new(None));
 
         #[cfg(unix)]
         let mut sigterm =
@@ -265,6 +293,12 @@ impl HttpServer {
         let force: bool = loop {
             tokio::select! {
                 Ok((stream, _)) = listener.accept() => {
+                    // Bug 5 fix — drop new connections during handover
+                    if !accepting.load(std::sync::atomic::Ordering::SeqCst) {
+                        drop(stream);
+                        continue;
+                    }
+
                     let server_clone = server.clone();
                     let restart_tx = restart_tx.clone();
                     let context = telemetry::create_context!("http.request");
@@ -296,14 +330,14 @@ impl HttpServer {
                     }.instrument(context));
                 }
 
-                Some(force) = restart_rx.recv() => {
+                Some(restart_req) = restart_rx.recv() => {
                     if restart_in_progress {
                         telemetry::info!("Restart already in progress, ignoring duplicate.");
                         continue;
                     }
 
                     restart_in_progress = true;
-                    telemetry::info!("Restart triggered. Force: {}", force);
+                    telemetry::info!("Restart triggered. Force: {}", restart_req.force);
 
                     let mut current_exe = match std::env::current_exe() {
                         Ok(exe) => exe,
@@ -332,37 +366,117 @@ impl HttpServer {
                             }
                         };
 
+                    // Bug 7 fix — store PID so we can kill it on SIGINT/SIGTERM
+                    *child_pid.lock().unwrap() = Some(child.id());
+
                     telemetry::info!(
-                        "New process spawned (PID {}). Verifying stability...",
-                        child.id()
+                        "New process spawned (PID {}). Verifying stability for {}s...",
+                        child.id(),
+                        server.restart_stability_window.as_secs(),
                     );
 
                     let result_tx = result_tx.clone();
+                    let stability_window = server.restart_stability_window;
+
                     tokio::spawn(async move {
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        if let Ok(Some(status)) = child.try_wait() {
-                            telemetry::warn!("New instance crashed: {}", status);
-                            let _ = result_tx.send(Err(()));
-                        } else {
-                            let _ = result_tx.send(Ok(force));
+                        // Bug 3 fix — configurable stability window
+                        tokio::time::sleep(stability_window).await;
+
+                        // Bug 2 fix — explicit match on all try_wait outcomes
+                        match child.try_wait() {
+                            Ok(Some(status)) => {
+                                telemetry::warn!("New instance crashed with status: {}", status);
+                                let _ = result_tx.send(Err(()));
+                            }
+                            Ok(None) => {
+                                telemetry::info!("New instance appears stable.");
+                                let _ = result_tx.send(Ok(restart_req));
+                            }
+                            Err(e) => {
+                                telemetry::warn!(
+                                    "Failed to check new instance status: {}. Aborting restart.",
+                                    e
+                                );
+                                let _ = result_tx.send(Err(()));
+                            }
                         }
                     });
                 }
 
-                Some(result) = result_rx.recv() => {
+                // Bug 4 fix — handle None from result_rx (channel unexpectedly closed)
+                result = result_rx.recv() => {
                     match result {
-                        Ok(force) => {
-                            telemetry::info!("New instance stable. Handing over.");
-                            break force;
+                        Some(Ok(restart_req)) => {
+                            telemetry::info!("New instance stable. Stopping new connections...");
+
+                            // Bug 5 fix — stop accepting before snapshot + pre-hook
+                            accepting.store(false, std::sync::atomic::Ordering::SeqCst);
+
+                            let ctx = RestartContext {
+                                active_requests: server.active_requests
+                                    .snapshot()
+                                    .into_values()
+                                    .collect(),
+                            };
+
+                            telemetry::info!(
+                                "Running pre-hook with {} active requests in flight...",
+                                ctx.active_requests.len()
+                            );
+
+                            // Bug 6 fix — pre-hook timeout so it can't hang forever
+                            match tokio::time::timeout(
+                                server.restart_pre_hook_timeout,
+                                (restart_req.pre_hook)(ctx),
+                            ).await {
+                                Ok(_) => {
+                                    telemetry::info!("Pre-hook complete. Handing over.");
+                                }
+                                Err(_) => {
+                                    telemetry::warn!(
+                                        "Pre-hook timed out after {}s. Proceeding with handover.",
+                                        server.restart_pre_hook_timeout.as_secs()
+                                    );
+                                }
+                            }
+
+                            break restart_req.force;
                         }
-                        Err(_) => {
+                        Some(Err(_)) => {
                             telemetry::warn!("Restart failed. Unlocking for future attempts.");
+                            // Clear child PID — that process is gone
+                            *child_pid.lock().unwrap() = None;
+                            restart_in_progress = false;
+                        }
+                        None => {
+                            // Bug 4 fix — result channel closed unexpectedly
+                            telemetry::warn!("Result channel closed unexpectedly. Unlocking.");
+                            *child_pid.lock().unwrap() = None;
                             restart_in_progress = false;
                         }
                     }
                 }
 
                 _ = tokio::signal::ctrl_c() => {
+                    // Bug 7 fix — kill child if restart was in progress
+                    if restart_in_progress {
+                        if let Some(pid) = *child_pid.lock().unwrap() {
+                            telemetry::warn!(
+                                "SIGINT received during restart. Killing child PID {}.",
+                                pid
+                            );
+                            #[cfg(unix)]
+                            unsafe {
+                                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                            }
+                            #[cfg(not(unix))]
+                            {
+                                let _ = std::process::Command::new("taskkill")
+                                    .args(["/PID", &pid.to_string(), "/F"])
+                                    .spawn();
+                            }
+                        }
+                    }
                     telemetry::info!("SIGINT received. Graceful shutdown.");
                     break false;
                 }
@@ -373,6 +487,25 @@ impl HttpServer {
                     #[cfg(not(unix))]
                     std::future::pending::<()>().await;
                 } => {
+                    // Bug 7 fix — kill child if restart was in progress
+                    if restart_in_progress {
+                        if let Some(pid) = *child_pid.lock().unwrap() {
+                            telemetry::warn!(
+                                "SIGTERM received during restart. Killing child PID {}.",
+                                pid
+                            );
+                            #[cfg(unix)]
+                            unsafe {
+                                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                            }
+                            #[cfg(not(unix))]
+                            {
+                                let _ = std::process::Command::new("taskkill")
+                                    .args(["/PID", &pid.to_string(), "/F"])
+                                    .spawn();
+                            }
+                        }
+                    }
                     telemetry::info!("SIGTERM received. Graceful shutdown.");
                     break false;
                 }
@@ -387,7 +520,8 @@ impl HttpServer {
         } else {
             telemetry::info!("Graceful shutdown. Waiting for active requests.");
             server.active_requests.wait_for_zero().await;
-            thread_pool.join_all().await;
+            // Bug 1 fix — use join_next loop for broader Tokio version compatibility
+            while thread_pool.join_next().await.is_some() {}
         }
 
         telemetry::info!("Shutdown complete.");
@@ -397,7 +531,7 @@ impl HttpServer {
     async fn handle_connection(
         &self,
         mut transport: Transport,
-        restart_tx: tokio::sync::mpsc::UnboundedSender<bool>,
+        restart_tx: tokio::sync::mpsc::UnboundedSender<RestartRequest>,
     ) {
         loop {
             let request_id = Uuid::new_v4();
@@ -418,7 +552,7 @@ impl HttpServer {
         &self,
         transport: Transport,
         request_id: Uuid,
-        restart_tx: tokio::sync::mpsc::UnboundedSender<bool>,
+        restart_tx: tokio::sync::mpsc::UnboundedSender<RestartRequest>,
     ) -> Option<Transport> {
         // ── Parse ──────────────────────────────────────────────────────
         let mut call = match tokio::time::timeout(
@@ -585,6 +719,8 @@ pub struct HttpServerBuilder {
     max_body_size: usize,
     on_request_complete: Option<OnRequestComplete>,
     routes: Vec<RouteDefinition>,
+    restart_stability_window: std::time::Duration,
+    restart_pre_hook_timeout: std::time::Duration,
 }
 
 impl HttpServerBuilder {
@@ -600,6 +736,8 @@ impl HttpServerBuilder {
             routes: inventory::iter::<RouteFactory>()
                 .map(|f| (f.factory)())
                 .collect(),
+            restart_stability_window: std::time::Duration::from_secs(5),
+            restart_pre_hook_timeout: std::time::Duration::from_secs(30),
         }
     }
 
@@ -639,6 +777,16 @@ impl HttpServerBuilder {
 
     pub fn route(mut self, route_definition: RouteDefinition) -> Self {
         self.routes.push(route_definition);
+        self
+    }
+
+    pub fn restart_stability_window(mut self, duration: std::time::Duration) -> Self {
+        self.restart_stability_window = duration;
+        self
+    }
+
+    pub fn restart_pre_hook_timeout(mut self, duration: std::time::Duration) -> Self {
+        self.restart_pre_hook_timeout = duration;
         self
     }
 
@@ -686,6 +834,8 @@ impl HttpServerBuilder {
             request_timeout: self.request_timeout,
             keep_alive_timeout: self.keep_alive_timeout,
             max_body_size: self.max_body_size,
+            restart_stability_window: self.restart_stability_window,
+            restart_pre_hook_timeout: self.restart_pre_hook_timeout,
         })
     }
 }
