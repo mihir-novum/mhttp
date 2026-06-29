@@ -7,11 +7,11 @@ use crate::response::{
     HttpResponse, HttpResponseBodyUnInitialized, HttpResponseInit, ResponseHook,
 };
 use crate::route_definition::{RouteDefinition, RouteDefinitionError, RouteFactory};
+use crate::router::Router;
 use crate::tls::{TlsConfig, TlsConfigError};
 use crate::transport::Transport;
 use crate::{HttpMethod, HttpStatusCode};
 use bytes::Bytes;
-use regex::Regex;
 use socket2::Socket;
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -168,11 +168,11 @@ impl HttpCall {
         self.request.route()
     }
 
-    pub fn header<S: Into<String>>(&self, name: S) -> Option<&str> {
+    pub fn header(&self, name: &str) -> Option<&str> {
         self.request.header(name)
     }
 
-    pub fn cookie<S: Into<String>>(&self, name: S) -> Option<&str> {
+    pub fn cookie(&self, name: &str) -> Option<&str> {
         self.request.cookie(name)
     }
 
@@ -242,22 +242,23 @@ impl HttpCall {
     }
 
     pub fn path_param(&self, param_name: &str) -> Option<&str> {
-        let map = self.request.path_params.get_or_init(|| {
-            if let Some(regex) = &self.request.matched_route_regex {
-                HttpParam::parse_path_params(regex, &self.request.route)
-            } else {
-                HashMap::new()
-            }
-        });
-        map.get(param_name).map(|s| s.as_ref())
+        self.request
+            .path_params
+            .iter()
+            .find(|(k, _)| k.as_ref() == param_name)
+            .map(|(_, v)| v.as_ref())
     }
 
     pub fn query_param(&self, param_name: &str) -> Option<&str> {
-        let map = self
+        let params = self
             .request
             .query_params
             .get_or_init(|| HttpParam::parse_query_params(&self.request.route));
-        map.get(param_name).map(|s| s.as_ref())
+
+        params
+            .iter()
+            .find(|(k, _)| k.as_ref() == param_name)
+            .map(|(_, v)| v.as_ref())
     }
 
     pub fn set_extras<K: Into<String>, V: Into<String>>(&mut self, key: K, value: V) {
@@ -281,10 +282,6 @@ impl HttpCall {
 
     pub fn remove_extras(&mut self, key: &str) -> Option<String> {
         self.extras.remove(key)
-    }
-
-    pub(crate) fn set_matched_route(&mut self, regex: Regex) {
-        self.request.matched_route_regex = Some(regex);
     }
 
     pub(crate) fn response_sent(&self) -> bool {
@@ -381,7 +378,7 @@ type OnRequestComplete =
 // ── HttpServer ─────────────────────────────────────────────────────────────
 
 pub struct HttpServer {
-    router: Vec<RouteDefinition>,
+    router: Router,
     listeners: Vec<TcpListener>,
     active_requests: ActiveRequest,
     on_request_complete: Option<OnRequestComplete>,
@@ -759,18 +756,29 @@ impl HttpServer {
         }
 
         // ── Route matching ─────────────────────────────────────────────
-        let route = match self.router.iter().find(|route| {
-            let method_match = &route.method == call.request.method()
-                || (is_head && route.method == HttpMethod::GET);
-            route.route.is_match(call.request.route()) && method_match
-        }) {
-            Some(route) => route,
-            None => {
-                let mut allowed_methods = Vec::new();
 
-                for route in &self.router {
-                    if route.route.is_match(call.request.route()) {
-                        allowed_methods.push(route.method.to_string());
+        let method_to_match = if is_head {
+            &HttpMethod::GET
+        } else {
+            call.request.method()
+        };
+
+        let request_route = call.request.route.clone();
+
+        let matched = match self.router.find(method_to_match, request_route.as_ref()) {
+            Some(m) => m,
+            None => {
+                // Find all allowed methods for the 405 Allow Header
+                let mut allowed_methods = Vec::new();
+                for m in [
+                    HttpMethod::GET,
+                    HttpMethod::POST,
+                    HttpMethod::PUT,
+                    HttpMethod::DELETE,
+                    HttpMethod::PATCH,
+                ] {
+                    if self.router.find(&m, call.request.route()).is_some() {
+                        allowed_methods.push(m.to_string());
                     }
                 }
 
@@ -798,13 +806,18 @@ impl HttpServer {
                 }
 
                 let _ = call.connection.write_response(resp.empty()).await;
-
                 return self.finish(call.connection, keep_alive).await;
             }
         };
 
+        call.request.path_params = matched
+            .params
+            .into_iter()
+            .map(|(k, v)| (Arc::from(k), Arc::from(v)))
+            .collect();
+
         // ── Middleware ─────────────────────────────────────────────────
-        for middleware in route.middleware.iter() {
+        for middleware in matched.route.middleware.iter() {
             middleware(&mut call).await;
             if call.response_sent() {
                 return self.finish(call.connection, keep_alive).await;
@@ -812,7 +825,7 @@ impl HttpServer {
         }
 
         // ── Handler ────────────────────────────────────────────────────
-        (route.handler)(&mut call).await;
+        (matched.route.handler)(&mut call).await;
 
         self.finish(call.connection, keep_alive).await
     }
@@ -850,7 +863,7 @@ pub struct HttpServerBuilder {
     keep_alive_timeout: std::time::Duration,
     max_body_size: usize,
     on_request_complete: Option<OnRequestComplete>,
-    routes: Vec<RouteDefinition>,
+    router: Vec<RouteDefinition>,
     restart_stability_window: std::time::Duration,
     restart_pre_hook_timeout: std::time::Duration,
 }
@@ -865,7 +878,7 @@ impl HttpServerBuilder {
             keep_alive_timeout: std::time::Duration::from_secs(75),
             max_body_size: 10 * 1024 * 1024,
             on_request_complete: None,
-            routes: inventory::iter::<RouteFactory>()
+            router: inventory::iter::<RouteFactory>()
                 .map(|f| (f.factory)())
                 .collect(),
             restart_stability_window: std::time::Duration::from_secs(5),
@@ -908,7 +921,7 @@ impl HttpServerBuilder {
     }
 
     pub fn route(mut self, route_definition: RouteDefinition) -> Self {
-        self.routes.push(route_definition);
+        self.router.push(route_definition);
         self
     }
 
@@ -976,7 +989,7 @@ impl HttpServerBuilder {
         };
 
         Ok(HttpServer {
-            router: self.routes,
+            router: Router::build(self.router),
             listeners,
             active_requests: ActiveSet::new_with_telemetry(self.on_request_complete.is_some()),
             on_request_complete: self.on_request_complete,

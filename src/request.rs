@@ -2,8 +2,7 @@ use crate::body::Body;
 use crate::cookie_store::CookieStore;
 use crate::field_lines::FieldLines;
 use bytes::Bytes;
-use regex::Regex;
-use std::collections::HashMap;
+use std::borrow::Cow;
 use std::fmt::{Display, Formatter};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
@@ -102,34 +101,14 @@ pub enum HttpParam {
 }
 
 impl HttpParam {
-    pub fn parse_path_params(regex: &Regex, input: &str) -> HashMap<Arc<str>, Arc<str>> {
-        let caps = match regex.captures(input) {
-            Some(caps) => caps,
-            None => {
-                return HashMap::new();
-            }
-        };
-
-        regex
-            .capture_names()
-            .flatten()
-            .filter_map(|name| {
-                caps.name(name)
-                    .map(|m| (Arc::from(name), Arc::from(m.as_str())))
-            })
-            .collect()
-    }
-
-    pub(crate) fn parse_query_params(url: &str) -> HashMap<Arc<str>, Arc<str>> {
+    pub(crate) fn parse_query_params(url: &str) -> Vec<(Arc<str>, Arc<str>)> {
         let query = url.split_once('?').map(|(_, q)| q).unwrap_or("");
 
-        form_urlencoded::parse(query.as_bytes()).into_owned().fold(
-            HashMap::new(),
-            |mut map, (k, v)| {
-                map.insert(Arc::from(k), Arc::from(v));
-                map
-            },
-        )
+        form_urlencoded::parse(query.as_bytes())
+            .into_iter()
+            // Convert the Cow<str> into Arc<str>
+            .map(|(k, v)| (Arc::from(k.as_ref()), Arc::from(v.as_ref())))
+            .collect()
     }
 }
 
@@ -153,9 +132,11 @@ pub(crate) struct HttpRequest {
     cookies: CookieStore,
     pub(crate) max_body_size: usize,
     pub(crate) body_state: BodyState,
-    pub(crate) matched_route_regex: Option<Regex>,
-    pub(crate) path_params: OnceLock<HashMap<Arc<str>, Arc<str>>>,
-    pub(crate) query_params: OnceLock<HashMap<Arc<str>, Arc<str>>>,
+
+    // OPTIMIZATION: Replaced HashMap with Vec.
+    // Vec::new() allocates 0 bytes on the heap. HashMap::new() allocates ~100 bytes.
+    pub(crate) path_params: Vec<(Arc<str>, Arc<str>)>,
+    pub(crate) query_params: OnceLock<Vec<(Arc<str>, Arc<str>)>>,
 }
 
 impl HttpRequest {
@@ -169,12 +150,10 @@ impl HttpRequest {
             IpAddr::V6(ip) => (None, Some(ip)),
         };
 
-        // SIMD search for the end of the request line (Extremely fast)
         let req_line_end = memchr::memchr(b'\n', &header_bytes).ok_or(
             HttpRequestError::RequestLineParsingFailed("Missing request line".into()),
         )?;
 
-        // Parse Request Line without holding onto `Bytes` references
         let (method, route, http_version) = {
             let mut line = &header_bytes[..req_line_end];
             if line.last() == Some(&b'\r') {
@@ -199,13 +178,13 @@ impl HttpRequest {
             let r_str = std::str::from_utf8(&line[after_method..second_space]).unwrap_or("");
             let route = Arc::from(r_str);
 
-            // CRITICAL FIX: Copy the 8 tiny bytes so `header_bytes` can be fully dropped later!
-            let version = Bytes::copy_from_slice(&line[version_start..]);
+            // OPTIMIZATION: `.slice()` is zero-copy! It just bumps the ref-count of `header_bytes`.
+            // `copy_from_slice()` allocates new memory.
+            let version = header_bytes.slice(version_start..line.len());
 
             (method, route, version)
         };
 
-        // Parse headers. FieldLines::from uses &[u8] and copies into its own Strings.
         let field_lines = FieldLines::from(&header_bytes[req_line_end + 1..]);
 
         let host = field_lines.get("host").map(|h| Arc::from(h.trim()));
@@ -230,8 +209,6 @@ impl HttpRequest {
             None => CookieStore::new(),
         };
 
-        // -> `header_bytes` drops here! Tokio reclaims the 8KB pool instantly! <-
-
         Ok(Self {
             client_ipv4_address,
             client_ipv6_address,
@@ -242,15 +219,12 @@ impl HttpRequest {
             field_lines,
             cookies,
             max_body_size,
-
-            // Lazy evaluations
             body_state: BodyState::Unread {
                 content_length,
                 is_chunked,
             },
-            matched_route_regex: None,
-            path_params: std::sync::OnceLock::new(),
-            query_params: std::sync::OnceLock::new(),
+            path_params: Vec::new(), // 0 Heap Allocations!
+            query_params: OnceLock::new(),
         })
     }
 
@@ -270,12 +244,14 @@ impl HttpRequest {
         &self.http_version
     }
 
-    pub(crate) fn header<S: Into<String>>(&self, name: S) -> Option<&str> {
-        self.field_lines.get(name.into().as_str())
+    // OPTIMIZATION: Removed `S: Into<String>`!
+    // This stops silent String allocations every time you check a header.
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
+        self.field_lines.get(name)
     }
 
-    pub(crate) fn cookie<S: Into<String>>(&self, name: S) -> Option<&str> {
-        self.cookies.get(name.into().as_str())
+    pub(crate) fn cookie(&self, name: &str) -> Option<&str> {
+        self.cookies.get(name)
     }
 
     pub(crate) fn route(&self) -> &str {

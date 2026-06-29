@@ -1,12 +1,11 @@
 use crate::request::HttpMethod;
 use crate::server::HttpCall;
-use regex::Regex;
 use std::sync::Arc;
 
 #[derive(thiserror::Error, Debug)]
 pub enum RouteDefinitionError {
-    #[error("regex {0} is invalid")]
-    InvalidRegex(String),
+    #[error("invalid route pattern: {0}")]
+    InvalidPattern(String),
 }
 
 pub type RouteHandler =
@@ -16,7 +15,7 @@ pub type MiddlewareHandler =
     Arc<dyn for<'r> Fn(&'r mut HttpCall) -> futures::future::BoxFuture<'r, ()> + Send + Sync>;
 
 pub struct RouteDefinition {
-    pub route: Regex,
+    pub pattern: Arc<str>,
     pub method: HttpMethod,
     pub handler: RouteHandler,
     pub middleware: Vec<MiddlewareHandler>,
@@ -33,76 +32,78 @@ impl RouteDefinition {
         S: Into<String>,
     {
         let route_str = route.into();
-        let route_regex =
-            Self::parse_route(&route_str).map_err(RouteDefinitionError::InvalidRegex)?;
+
+        // Validate the route syntax at build-time
+        Self::validate_route(&route_str).map_err(RouteDefinitionError::InvalidPattern)?;
+
         Ok(Self {
-            route: route_regex,
+            pattern: Arc::from(route_str),
             method,
             middleware: Vec::from(middleware.into_boxed_slice()),
             handler,
         })
     }
 
-    fn parse_route(route: &str) -> Result<Regex, String> {
+    /// Validates route patterns (e.g. proper braces, valid parameter names)
+    fn validate_route(route: &str) -> Result<(), String> {
         if !route.starts_with('/') {
             return Err("route must start with '/'".into());
         }
 
-        let mut re = String::with_capacity(route.len() * 2);
-        re.push('^');
+        let mut in_param = false;
+        let mut param_start = 0;
+        let mut param_name = String::new();
 
-        let mut it = route.char_indices().peekable();
-        while let Some((i, ch)) = it.next() {
+        for (i, ch) in route.char_indices() {
             match ch {
                 '{' => {
-                    let start = i;
-                    let mut name = String::new();
-                    for (_, c) in it.by_ref() {
-                        if c == '}' {
-                            break;
-                        }
-                        name.push(c);
+                    if in_param {
+                        return Err(format!("unexpected '{{' at byte index {}", i));
                     }
-                    if name.is_empty() {
-                        return Err(format!("empty parameter name at byte index {}", start));
+                    in_param = true;
+                    param_start = i;
+                    param_name.clear();
+                }
+                '}' => {
+                    if !in_param {
+                        return Err(format!("unexpected '}}' at byte index {}", i));
                     }
-                    if !Self::is_valid_param_name(&name) {
+                    in_param = false;
+
+                    if param_name.is_empty() {
                         return Err(format!(
-                            "invalid parameter name '{name}' (use [A-Za-z_][A-Za-z0-9_]*)"
+                            "empty parameter name at byte index {}",
+                            param_start
                         ));
                     }
-                    re.push_str("(?P<");
-                    re.push_str(&name);
-                    if name == "__path__" {
-                        re.push_str(">[^?#]*)");
-                    } else {
-                        re.push_str(">[^/?#]+)");
+
+                    if !Self::is_valid_param_name(&param_name) {
+                        return Err(format!(
+                            "invalid parameter name '{param_name}' (use [A-Za-z_][A-Za-z0-9_]*)"
+                        ));
                     }
                 }
-                '}' => return Err(format!("unexpected '}}' at byte index {}", i)),
-                c => {
-                    if Self::is_regex_meta(c) {
-                        re.push('\\');
+                _ => {
+                    if in_param {
+                        param_name.push(ch);
                     }
-                    re.push(c);
                 }
             }
         }
 
-        if route != "/" {
-            if re.ends_with('/') {
-                re.pop();
-            }
+        if in_param {
+            return Err("unclosed '{' in route pattern".into());
+        }
 
-            if !re.ends_with(">[^?#]*)") {
-                re.push_str("/?");
+        // Ensure the {__path__} catch-all only appears at the very end
+        if let Some(idx) = route.find("{__path__}") {
+            let tail = &route[idx + 10..];
+            if !tail.is_empty() && tail != "/" {
+                return Err("catch-all {__path__} must be at the end of the route".into());
             }
         }
 
-        re.push_str("(?:\\?[^#\\s]*)?(?:#[^\\s]*)?");
-
-        re.push('$');
-        Regex::new(&re).map_err(|e| e.to_string())
+        Ok(())
     }
 
     #[inline(always)]
@@ -113,14 +114,6 @@ impl RouteDefinition {
             _ => return false,
         }
         it.all(|c| c.is_ascii_alphanumeric() || c == '_')
-    }
-
-    #[inline(always)]
-    fn is_regex_meta(c: char) -> bool {
-        matches!(
-            c,
-            '\\' | '.' | '+' | '*' | '?' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|'
-        )
     }
 }
 

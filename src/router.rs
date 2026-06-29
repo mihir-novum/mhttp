@@ -29,14 +29,13 @@ impl Segment {
 /// A fully matched route with captured parameters.
 pub(crate) struct Match<'a> {
     pub route: &'a RouteDefinition,
-    pub params: Vec<(&'a str, String)>, // (param_name, captured_value)
+    pub params: Vec<(&'a str, &'a str)>, // (param_name, captured_value) - completely avoids String allocations
 }
 
 /// One node in the prefix tree.
 /// Each node represents one path segment.
 struct Node {
     /// Routes that terminate exactly at this node, keyed by HTTP method.
-    /// Multiple methods can match the same path (GET /users, POST /users).
     handlers: Vec<RouteDefinition>,
 
     /// Children for exact static segment matches.
@@ -44,7 +43,6 @@ struct Node {
     static_children: Vec<(String, Node)>,
 
     /// Child for a named parameter segment e.g. {id}.
-    /// Only one param child per node — ambiguous routes are rejected at build time.
     param_child: Option<(String, Box<Node>)>, // (param_name, child_node)
 
     /// Child for the catch-all {__path__} — always a leaf.
@@ -71,7 +69,6 @@ impl Node {
 
         match &segments[0] {
             Segment::Static(s) => {
-                // Binary search for existing static child
                 match self
                     .static_children
                     .binary_search_by(|(k, _)| k.as_str().cmp(s.as_str()))
@@ -108,29 +105,29 @@ impl Node {
     /// Returns the matched RouteDefinition and captured params if found.
     fn find<'a>(
         &'a self,
-        segments: &[&str],
+        path: &'a str,
         method: &HttpMethod,
-        params: &mut Vec<(&'a str, String)>,
+        params: &mut Vec<(&'a str, &'a str)>,
     ) -> Option<&'a RouteDefinition> {
-        if segments.is_empty() {
-            // 1. Look for an exact match handler
-            if let Some(found) = self.handlers.iter().find(|r| &r.method == method) {
-                return Some(found);
-            }
-
-            // 2. CRITICAL FIX: Check catch-all for empty tails!
-            // (e.g. `/assets` successfully matches `/assets/{__path__}` with an empty string)
-            if let Some(route) = &self.catch_all {
-                if &route.method == method {
-                    params.push(("__path__", String::new()));
-                    return Some(route);
+        let (seg, rest) = match next_segment(path) {
+            Some(t) => t,
+            None => {
+                // 1. Look for an exact match handler
+                if let Some(found) = self.handlers.iter().find(|r| &r.method == method) {
+                    return Some(found);
                 }
-            }
-            return None;
-        }
 
-        let seg = segments[0];
-        let rest = &segments[1..];
+                // 2. CRITICAL FIX: Check catch-all for empty tails!
+                // (e.g. `/assets` successfully matches `/assets/{__path__}` with an empty string)
+                if let Some(route) = &self.catch_all {
+                    if &route.method == method {
+                        params.push(("__path__", ""));
+                        return Some(route);
+                    }
+                }
+                return None;
+            }
+        };
 
         // 1. Try exact static match first — most specific, highest priority
         if let Ok(idx) = self
@@ -145,7 +142,7 @@ impl Node {
         // 2. Try param match — captures the segment value
         if let Some((param_name, child)) = &self.param_child {
             let saved_len = params.len();
-            params.push((param_name.as_str(), seg.to_string()));
+            params.push((param_name.as_str(), seg));
 
             if let Some(found) = child.find(rest, method, params) {
                 return Some(found);
@@ -158,14 +155,26 @@ impl Node {
         // 3. Try catch-all — matches this segment and everything remaining
         if let Some(route) = &self.catch_all {
             if &route.method == method {
-                // Capture everything remaining including current segment
-                let tail = segments.join("/");
+                // Capture everything remaining starting from current segment (Zero Allocations!)
+                let tail = path.trim_start_matches('/');
                 params.push(("__path__", tail));
                 return Some(route);
             }
         }
 
         None
+    }
+}
+
+/// Helper function to extract the next non-empty segment and the remaining path string slice.
+fn next_segment(path: &str) -> Option<(&str, &str)> {
+    let trimmed = path.trim_start_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    match trimmed.find('/') {
+        Some(idx) => Some((&trimmed[..idx], &trimmed[idx..])),
+        None => Some((trimmed, "")),
     }
 }
 
@@ -182,7 +191,7 @@ impl Router {
         let mut root = Node::new();
 
         for route in routes {
-            let segments = Self::parse_segments(&route.route.as_str());
+            let segments = Self::parse_segments(&route.pattern);
             root.insert(&segments, route);
         }
 
@@ -192,20 +201,18 @@ impl Router {
     /// Find a matching route for the given method and path.
     /// Strips query string before matching.
     /// Returns None if no route matches.
-    pub fn find<'a>(&'a self, method: &HttpMethod, path: &str) -> Option<Match<'a>> {
+    pub fn find<'a>(&'a self, method: &HttpMethod, path: &'a str) -> Option<Match<'a>> {
         // Strip query string — match on path only
         let path = match path.find('?') {
             Some(i) => &path[..i],
             None => path,
         };
 
-        // Split path into segments, filtering empty strings from leading/trailing '/'
-        let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-
-        let mut params: Vec<(&str, String)> = Vec::new();
+        // Instantiates with capacity zero - 0 Heap Allocations for purely static routes!
+        let mut params = Vec::new();
 
         self.root
-            .find(&segments, method, &mut params)
+            .find(path, method, &mut params)
             .map(|route| Match { route, params })
     }
 
