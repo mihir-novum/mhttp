@@ -1,5 +1,5 @@
 use base64::Engine;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 use serde_json::Value;
@@ -286,14 +286,15 @@ impl Body {
             return Err("body too large".to_string());
         }
 
-        let mut buffer = vec![0; content_len];
+        let mut buffer = BytesMut::with_capacity(content_len);
+        buffer.resize(content_len, 0);
         reader
             .read_exact(&mut buffer)
             .await
             .map_err(|e| e.to_string())?;
 
         Ok(Self::Bytes {
-            bytes: buffer.into(),
+            bytes: buffer.freeze(),
             content_type,
         })
     }

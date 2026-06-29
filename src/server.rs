@@ -613,7 +613,7 @@ impl HttpServer {
                 };
                 let mut conn = Connection::new(stream);
                 conn.set_keep_alive(false, 0);
-                
+
                 let _ = conn
                     .write_response(
                         HttpResponse::new(
@@ -873,6 +873,16 @@ impl HttpServerBuilder {
             .listen(1024)
             .map_err(|_| HttpServerError::AddrInUse(self.port))?;
         socket.set_nonblocking(true).unwrap_or(());
+        socket.set_tcp_nodelay(true).unwrap_or(());
+        socket.set_recv_buffer_size(256 * 1024).unwrap_or(());
+        socket.set_send_buffer_size(256 * 1024).unwrap_or(());
+        socket
+            .set_tcp_keepalive(
+                &socket2::TcpKeepalive::new()
+                    .with_time(std::time::Duration::from_secs(60))
+                    .with_interval(std::time::Duration::from_secs(10)),
+            )
+            .unwrap_or(());
 
         let std_listener: std::net::TcpListener = socket.into();
         let listener = TcpListener::from_std(std_listener)

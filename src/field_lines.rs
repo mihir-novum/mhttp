@@ -50,8 +50,12 @@ impl FieldLines {
             buf.put_slice(field_value.as_bytes());
             buf.put_slice(b"\r\n");
         }
-        
+
         buf.freeze()
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.map.iter().map(|(k, v)| (k.as_str(), v.as_str()))
     }
 }
 

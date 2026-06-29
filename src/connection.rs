@@ -4,11 +4,42 @@ use crate::field_lines::FieldLines;
 use crate::request::{HttpRequest, HttpRequestError};
 use crate::response::{HttpResponse, HttpResponseBodyInitialized};
 use crate::transport::Transport;
-use bytes::BytesMut;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use std::cell::RefCell;
+use std::sync::OnceLock;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
+
+static CACHED_DATE: OnceLock<parking_lot::RwLock<(u64, String)>> = OnceLock::new();
+
+thread_local! {
+    static HEADER_BUF: RefCell<BytesMut> = RefCell::new(BytesMut::with_capacity(4096));
+}
+
+fn get_date_header() -> String {
+    let cache = CACHED_DATE.get_or_init(|| parking_lot::RwLock::new((0, String::new())));
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    {
+        let read = cache.read();
+        if read.0 == now_secs {
+            return read.1.clone();
+        }
+    }
+
+    let formatted = chrono::Utc::now()
+        .format("%a, %d %b %Y %H:%M:%S GMT")
+        .to_string();
+
+    *cache.write() = (now_secs, formatted.clone());
+    formatted
+}
 
 pub(crate) struct Connection {
-    transport: Transport,
+    writer: BufWriter<Transport>,
     has_written_response: bool,
     keep_alive: bool,
     keep_alive_timeout_secs: u64,
@@ -17,7 +48,7 @@ pub(crate) struct Connection {
 impl Connection {
     pub(crate) fn new(transport: Transport) -> Self {
         Self {
-            transport,
+            writer: BufWriter::with_capacity(8 * 1024, transport),
             has_written_response: false,
             keep_alive: true,
             keep_alive_timeout_secs: 75,
@@ -39,8 +70,10 @@ impl Connection {
         keep_alive_timeout: std::time::Duration,
         request_timeout: std::time::Duration,
     ) -> Result<Option<HttpRequest>, HttpRequestError> {
-        let peer_addr = self.transport.peer_addr();
-        let mut reader = BufReader::new(&mut self.transport);
+        let transport = self.writer.get_mut();
+        let peer_addr = transport.peer_addr();
+
+        let mut reader = BufReader::new(transport);
 
         // =====================================================================
         // STAGE 1: IDLE TIMEOUT (Keep-Alive)
@@ -85,12 +118,7 @@ impl Connection {
     ) -> Result<(), tokio::io::Error> {
         self.has_written_response = true;
 
-        response.field_lines.set(
-            "date",
-            chrono::Utc::now()
-                .format("%a, %d %b %Y %H:%M:%S GMT")
-                .to_string(),
-        );
+        response.field_lines.set("date", get_date_header());
 
         response.field_lines.set(
             "connection",
@@ -123,33 +151,42 @@ impl Connection {
         let status_code = response.status_code.clone();
         let status_bytes = response.status_code.to_bytes();
 
-        let mut line =
-            BytesMut::with_capacity(response.http_version.len() + status_bytes.len() + 6);
-        line.extend_from_slice(&response.http_version);
-        line.extend_from_slice(b" ");
-        line.extend_from_slice(&status_bytes);
-        line.extend_from_slice(b"\r\n");
-        self.transport.write_all(&line).await?;
+        let header_bytes = HEADER_BUF.with(|cell| {
+            let mut buf = cell.borrow_mut();
+            buf.clear();
 
-        self.transport
-            .write_all(&response.field_lines.to_bytes())
-            .await?;
+            buf.put_slice(&response.http_version);
+            buf.put_slice(b" ");
+            buf.put_slice(&status_bytes);
+            buf.put_slice(b"\r\n");
 
-        if let Some(store) = &response.cookies {
-            let bytes = store.to_bytes();
-            if !bytes.is_empty() {
-                self.transport.write_all(&bytes).await?;
+            for (field_name, field_value) in response.field_lines.iter() {
+                buf.put_slice(field_name.as_bytes());
+                buf.put_slice(b": ");
+                buf.put_slice(field_value.as_bytes());
+                buf.put_slice(b"\r\n");
             }
-        }
 
-        self.transport.write_all(b"\r\n").await?;
+            if let Some(store) = &response.cookies {
+                let bytes = store.to_bytes();
+                if !bytes.is_empty() {
+                    buf.put_slice(&bytes);
+                }
+            }
+
+            buf.put_slice(b"\r\n");
+
+            buf.split().freeze()
+        });
+
+        self.writer.write_all(&header_bytes).await?;
 
         if !response.suppress_body && !status_forbids_body {
             self.write_body(response.body, &response.field_lines)
                 .await?;
         }
 
-        self.transport.flush().await?;
+        self.writer.flush().await?;
 
         if let Some(hook) = response.on_sent {
             hook(status_code);
@@ -174,10 +211,12 @@ impl Connection {
                     self.write_chunk(&bytes).await?;
                     self.write_terminating_chunk().await?;
                 } else {
-                    self.transport.write_all(&bytes).await?;
+                    self.writer.write_all(&bytes).await?;
                 }
             }
             Some(Body::Stream { reader, .. }) => {
+                self.writer.flush().await?;
+
                 let mut buffered = BufReader::with_capacity(64 * 1024, reader);
                 if is_chunked {
                     let mut buf = vec![0u8; 64 * 1024];
@@ -190,7 +229,7 @@ impl Connection {
                     }
                     self.write_terminating_chunk().await?;
                 } else {
-                    tokio::io::copy(&mut buffered, &mut self.transport).await?;
+                    tokio::io::copy(&mut buffered, &mut self.writer).await?;
                 }
             }
             None => {}
@@ -200,23 +239,56 @@ impl Connection {
     }
 
     async fn write_chunk(&mut self, data: &[u8]) -> Result<(), tokio::io::Error> {
-        self.transport
-            .write_all(format!("{:X}\r\n", data.len()).as_bytes())
-            .await?;
-        self.transport.write_all(data).await?;
-        self.transport.write_all(b"\r\n").await?;
+        let mut hex_buf = [0u8; 18]; // max usize hex is 16 chars + \r\n
+        let hex_str = format_hex(data.len(), &mut hex_buf);
+
+        self.writer.write_all(hex_str).await?;
+        self.writer.write_all(data).await?;
+        self.writer.write_all(b"\r\n").await?;
         Ok(())
     }
 
     async fn write_terminating_chunk(&mut self) -> Result<(), tokio::io::Error> {
-        self.transport.write_all(b"0\r\n\r\n").await
+        self.writer.write_all(b"0\r\n\r\n").await
     }
 
     pub async fn shutdown(&mut self) -> Result<(), tokio::io::Error> {
-        self.transport.shutdown().await
+        self.writer.flush().await?;
+        self.writer.get_mut().shutdown().await
     }
 
     pub(crate) fn into_transport(self) -> Transport {
-        self.transport
+        self.writer.into_inner()
     }
+}
+
+fn format_hex(n: usize, buf: &mut [u8; 18]) -> &[u8] {
+    if n == 0 {
+        buf[0] = b'0';
+        buf[1] = b'\r';
+        buf[2] = b'\n';
+        return &buf[..3];
+    }
+
+    // Write hex digits in reverse
+    let mut i = 15usize; // leave room for \r\n at end
+    let mut val = n;
+    while val > 0 {
+        let digit = (val & 0xF) as u8;
+        buf[i] = if digit < 10 {
+            b'0' + digit
+        } else {
+            b'a' + digit - 10
+        };
+        i -= 1;
+        val >>= 4;
+    }
+    i += 1; // i now points to first hex digit
+
+    // Append \r\n
+    let end = 16;
+    buf[end] = b'\r';
+    buf[end + 1] = b'\n';
+
+    &buf[i..end + 2]
 }

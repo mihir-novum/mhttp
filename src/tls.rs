@@ -4,6 +4,7 @@ use rustls_pemfile::{certs, private_key};
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
+use rustls::server::ServerSessionMemoryCache;
 use tokio_rustls::TlsAcceptor;
 
 #[derive(thiserror::Error, Debug)]
@@ -34,6 +35,7 @@ pub enum TlsConfig {
     },
 }
 
+
 impl TlsConfig {
     pub(crate) fn build(self) -> Result<TlsAcceptor, TlsConfigError> {
         let (certs, key) = match self {
@@ -43,9 +45,11 @@ impl TlsConfig {
             }
         };
 
-        let config = ServerConfig::builder()
+        let mut config = ServerConfig::builder()
             .with_no_client_auth()          // no mutual TLS
             .with_single_cert(certs, key)?;
+
+        config.session_storage = ServerSessionMemoryCache::new(10_000);
 
         Ok(TlsAcceptor::from(Arc::new(config)))
     }
