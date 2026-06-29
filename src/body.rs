@@ -1,5 +1,6 @@
+use crate::connection::Connection;
 use base64::Engine;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 use serde_json::Value;
@@ -273,66 +274,73 @@ impl Body {
         }
     }
 
-    pub(crate) async fn read_exact<R>(
-        reader: &mut BufReader<&mut R>,
+    pub(crate) async fn read_exact(
+        conn: &mut Connection,
         content_len: usize,
         max_body_size: usize,
         content_type: Option<String>,
-    ) -> Result<Self, String>
-    where
-        R: AsyncRead + Unpin + Send + 'static,
-    {
+    ) -> Result<Self, String> {
         if content_len > max_body_size {
             return Err("body too large".to_string());
         }
 
-        let mut buffer = BytesMut::with_capacity(content_len);
-        buffer.resize(content_len, 0);
-        reader
-            .read_exact(&mut buffer)
-            .await
-            .map_err(|e| e.to_string())?;
+        // Read directly into BytesMut until we have enough data
+        while conn.reader.len() < content_len {
+            if conn.reader.capacity() < 4096 {
+                conn.reader.reserve(8192);
+            }
 
-        Ok(Self::Bytes {
-            bytes: buffer.freeze(),
-            content_type,
-        })
+            let n = conn.writer.get_mut().read_buf(&mut conn.reader).await.map_err(|e| e.to_string())?;
+            if n == 0 {
+                return Err("stream closed unexpectedly".into());
+            }
+        }
+
+        // Steal exactly `content_len` bytes. O(1) split.
+        let bytes = conn.reader.split_to(content_len).freeze();
+
+        Ok(Self::Bytes { bytes, content_type })
     }
 
-    pub(crate) async fn read_chunked<R>(
-        reader: &mut BufReader<&mut R>,
+    pub(crate) async fn read_chunked(
+        conn: &mut Connection,
         max_body_size: usize,
         content_type: Option<String>,
-    ) -> Result<Body, String>
-    where
-        R: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    {
+    ) -> Result<Body, String> {
         let mut body = Vec::new();
 
         loop {
+            // 1. Find Chunk Size
             let mut size_line = Vec::new();
-            reader
-                .read_until(b'\n', &mut size_line)
-                .await
-                .map_err(|e| e.to_string())?;
+            loop {
+                if let Some(pos) = memchr::memchr(b'\n', &conn.reader) {
+                    let len = pos + 1;
+                    size_line.extend_from_slice(&conn.reader.split_to(len));
+                    break;
+                }
+
+                if conn.reader.capacity() < 4096 { conn.reader.reserve(8192); }
+                let n = conn.writer.get_mut().read_buf(&mut conn.reader).await.map_err(|e| e.to_string())?;
+                if n == 0 { return Err("stream closed unexpectedly".into()); }
+            }
 
             let size_str = std::str::from_utf8(&size_line)
-                .map_err(|_| "invalid chunk size line")?
-                .trim()
-                .split(';')
-                .next()
-                .unwrap_or("")
-                .trim();
+                .map_err(|_| "invalid chunk size line")?.trim().split(';').next().unwrap_or("").trim();
 
             let chunk_size = usize::from_str_radix(size_str, 16)
                 .map_err(|_e| format!("invalid chunk size: '{}'", size_str))?;
 
+            // 2. End of chunks
             if chunk_size == 0 {
-                let mut trailing = Vec::new();
-                reader
-                    .read_until(b'\n', &mut trailing)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                loop {
+                    if let Some(pos) = memchr::memchr(b'\n', &conn.reader) {
+                        let _ = conn.reader.split_to(pos + 1);
+                        break;
+                    }
+                    if conn.reader.capacity() < 4096 { conn.reader.reserve(8192); }
+                    let n = conn.writer.get_mut().read_buf(&mut conn.reader).await.map_err(|e| e.to_string())?;
+                    if n == 0 { break; }
+                }
                 break;
             }
 
@@ -340,28 +348,27 @@ impl Body {
                 return Err("body too large".to_string());
             }
 
-            let mut chunk = vec![0; chunk_size];
-            reader
-                .read_exact(&mut chunk)
-                .await
-                .map_err(|e| e.to_string())?;
-            body.extend_from_slice(&chunk);
+            // 3. Read Data
+            while conn.reader.len() < chunk_size {
+                if conn.reader.capacity() < 4096 { conn.reader.reserve(8192); }
+                let n = conn.writer.get_mut().read_buf(&mut conn.reader).await.map_err(|e| e.to_string())?;
+                if n == 0 { return Err("stream closed unexpectedly".into()); }
+            }
+            body.extend_from_slice(&conn.reader.split_to(chunk_size));
 
-            let mut crlf = [0u8; 2];
-            reader
-                .read_exact(&mut crlf)
-                .await
-                .map_err(|e| e.to_string())?;
-
-            if &crlf != b"\r\n" {
+            // 4. Read CRLF
+            while conn.reader.len() < 2 {
+                if conn.reader.capacity() < 4096 { conn.reader.reserve(8192); }
+                let n = conn.writer.get_mut().read_buf(&mut conn.reader).await.map_err(|e| e.to_string())?;
+                if n == 0 { return Err("stream closed unexpectedly".into()); }
+            }
+            let crlf = conn.reader.split_to(2);
+            if &crlf[..] != b"\r\n" {
                 return Err("missing CRLF after chunk data".to_string());
             }
         }
 
-        Ok(Self::Bytes {
-            bytes: body.into(),
-            content_type,
-        })
+        Ok(Self::Bytes { bytes: body.into(), content_type })
     }
 
     pub fn as_json(&self) -> Option<Value> {

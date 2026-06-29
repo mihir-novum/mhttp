@@ -2,7 +2,7 @@ use crate::active_set::ActiveSet;
 use crate::body::Body;
 use crate::connection::Connection;
 use crate::cors::Cors;
-use crate::request::{HttpRequest, HttpRequestError};
+use crate::request::{BodyState, HttpParam, HttpRequest, HttpRequestError};
 use crate::response::{
     HttpResponse, HttpResponseBodyUnInitialized, HttpResponseInit, ResponseHook,
 };
@@ -11,12 +11,14 @@ use crate::tls::{TlsConfig, TlsConfigError};
 use crate::transport::Transport;
 use crate::{HttpMethod, HttpStatusCode};
 use bytes::Bytes;
+use regex::Regex;
 use socket2::Socket;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
-use telemetry::__InstrumentTrait;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
@@ -30,6 +32,37 @@ pub enum HttpServerError {
     InvalidRouteDefinition(#[from] RouteDefinitionError),
     #[error("{0}")]
     Tls(#[from] TlsConfigError),
+}
+
+fn fast_request_id() -> Uuid {
+    // Thread-local: no atomic CAS, no cross-core cache invalidation.
+    thread_local! {
+        // Upper 32 bits = stable thread identifier seeded once.
+        static THREAD_SEED: u64 = {
+            use std::hash::{Hash, Hasher, DefaultHasher};
+            let mut h = DefaultHasher::new();
+            std::thread::current().id().hash(&mut h);
+            (h.finish() & 0xFFFF_FFFF) << 32
+        };
+        static SEQ: Cell<u32> = Cell::new(0);
+    }
+
+    let hi = THREAD_SEED.with(|&seed| {
+        let s = SEQ.with(|c| {
+            let v = c.get();
+            c.set(v.wrapping_add(1));
+            v
+        });
+        seed | s as u64
+    });
+
+    // Lower 64 bits: nanosecond timestamp for rough chronological ordering.
+    let lo = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as u64;
+
+    Uuid::from_u64_pair(hi, lo)
 }
 
 pub struct RestartContext {
@@ -147,16 +180,84 @@ impl HttpCall {
         &self.request_id
     }
 
-    pub fn body(&self) -> &Body {
-        self.request.body()
+    pub async fn body(&mut self) -> Result<&Body, String> {
+        // If it's already read, return it instantly
+        if matches!(self.request.body_state, BodyState::Read(_)) {
+            if let BodyState::Read(ref b) = self.request.body_state {
+                return Ok(b);
+            }
+        }
+
+        // Steal the state so we can mutate it
+        let state = std::mem::replace(&mut self.request.body_state, BodyState::Reading);
+
+        let (content_length, is_chunked) = match state {
+            BodyState::Unread {
+                content_length,
+                is_chunked,
+            } => (content_length, is_chunked),
+            _ => return Err("Body already read or error occurred".into()),
+        };
+
+        // 100-Continue handling (Lazy Evaluation!)
+        if self
+            .header("expect")
+            .map(|v| v.eq_ignore_ascii_case("100-continue"))
+            .unwrap_or(false)
+        {
+            let _ = self
+                .connection
+                .writer
+                .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+                .await;
+            let _ = self.connection.writer.flush().await;
+        }
+
+        let content_type = self.header("content-type").map(|s| s.to_string());
+
+        let body = if is_chunked {
+            Body::read_chunked(
+                &mut self.connection,
+                self.request.max_body_size,
+                content_type,
+            )
+            .await?
+        } else {
+            Body::read_exact(
+                &mut self.connection,
+                content_length,
+                self.request.max_body_size,
+                content_type,
+            )
+            .await?
+        };
+
+        self.request.body_state = BodyState::Read(body);
+
+        if let BodyState::Read(ref b) = self.request.body_state {
+            Ok(b)
+        } else {
+            unreachable!()
+        }
     }
 
-    pub fn path_param<K: Into<String>>(&self, param_name: K) -> Option<&str> {
-        self.request.path_param(param_name)
+    pub fn path_param(&self, param_name: &str) -> Option<&str> {
+        let map = self.request.path_params.get_or_init(|| {
+            if let Some(regex) = &self.request.matched_route_regex {
+                HttpParam::parse_path_params(regex, &self.request.route)
+            } else {
+                HashMap::new()
+            }
+        });
+        map.get(param_name).map(|s| s.as_ref())
     }
 
-    pub fn query_param<K: Into<String>>(&self, param_name: K) -> Option<&str> {
-        self.request.query_param(param_name)
+    pub fn query_param(&self, param_name: &str) -> Option<&str> {
+        let map = self
+            .request
+            .query_params
+            .get_or_init(|| HttpParam::parse_query_params(&self.request.route));
+        map.get(param_name).map(|s| s.as_ref())
     }
 
     pub fn set_extras<K: Into<String>, V: Into<String>>(&mut self, key: K, value: V) {
@@ -180,6 +281,10 @@ impl HttpCall {
 
     pub fn remove_extras(&mut self, key: &str) -> Option<String> {
         self.extras.remove(key)
+    }
+
+    pub(crate) fn set_matched_route(&mut self, regex: Regex) {
+        self.request.matched_route_regex = Some(regex);
     }
 
     pub(crate) fn response_sent(&self) -> bool {
@@ -276,8 +381,8 @@ type OnRequestComplete =
 // ── HttpServer ─────────────────────────────────────────────────────────────
 
 pub struct HttpServer {
-    routes: Vec<RouteDefinition>,
-    listener: Option<TcpListener>,
+    router: Vec<RouteDefinition>,
+    listeners: Vec<TcpListener>,
     active_requests: ActiveRequest,
     on_request_complete: Option<OnRequestComplete>,
     cors: Option<Cors>,
@@ -295,7 +400,7 @@ impl HttpServer {
     }
 
     pub fn listen(mut self) -> (RestartHandle, impl Future<Output = ()>) {
-        let listener = self.listener.take().expect("Listener must be initialized");
+        let listeners = std::mem::take(&mut self.listeners);
         let server = Arc::new(self);
 
         let (restart_tx, mut restart_rx) = tokio::sync::mpsc::unbounded_channel::<RestartRequest>();
@@ -307,7 +412,6 @@ impl HttpServer {
         };
 
         let fut = async move {
-            let mut thread_pool: JoinSet<()> = JoinSet::new();
             let mut restart_in_progress = false;
 
             let child_pid: Arc<std::sync::Mutex<Option<u32>>> =
@@ -317,68 +421,88 @@ impl HttpServer {
                 restart_tx: restart_tx.clone(),
             };
 
-            // Wrap in Option so we can drop early on restart
-            // without affecting the SIGINT/SIGTERM paths
-            let mut listener = Some(listener);
-
             #[cfg(unix)]
             let mut sigterm =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
 
+            // ── Multi-Listener Accept Pool ──────────────────────────────────────────
+            //
+            // One task per SO_REUSEPORT socket (= one per CPU core).
+            // Each task accepts and immediately spawns a free connection task —
+            // NO intermediate channel, NO cross-task wakeup, NO serialisation.
+            //
+            // Hot path per connection: listener.accept() → tokio::spawn()
+            // That's it. The control-plane select below never touches this path.
+            let mut accept_pool: JoinSet<()> = JoinSet::new();
+
+            for listener in listeners {
+                let server_clone = server.clone();
+                let restart_handle = connection_handle.clone();
+
+                accept_pool.spawn(async move {
+                    loop {
+                        match listener.accept().await {
+                            Ok((stream, _)) => {
+                                let srv = server_clone.clone();
+                                let rh = restart_handle.clone();
+
+                                // Spawn and forget — the connection task is fully
+                                // independent. Active-request tracking inside
+                                // handle_single_request handles graceful drain.
+                                tokio::spawn(async move {
+                                    let transport = match &srv.tls {
+                                        None => {
+                                            let peer_addr = match stream.peer_addr() {
+                                                Ok(a) => a,
+                                                Err(_) => return, // already closed
+                                            };
+                                            Transport::new(stream, peer_addr)
+                                        }
+                                        Some(acceptor) => {
+                                            match acceptor.accept(stream).await {
+                                                Ok(tls_stream) => {
+                                                    let peer_addr =
+                                                        match tls_stream.get_ref().0.peer_addr() {
+                                                            Ok(a) => a,
+                                                            Err(_) => return,
+                                                        };
+                                                    Transport::new(tls_stream, peer_addr)
+                                                }
+                                                Err(_) => return, // TLS handshake failed
+                                            }
+                                        }
+                                    };
+
+                                    srv.handle_connection(transport, rh).await;
+                                });
+                            }
+                            Err(_) => {
+                                // Brief yield on EMFILE/ENFILE to avoid a busy-loop
+                                // when the process hits its file-descriptor limit.
+                                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                            }
+                        }
+                    }
+                });
+            }
+
+            // ── Control Plane ───────────────────────────────────────────────────────
+            //
+            // This select loop is entirely off the hot path. It only wakes on
+            // infrequent events: restart requests, OS signals, child-process results.
+            // Connection throughput is completely unaffected by what happens here.
             let force: bool = loop {
                 tokio::select! {
-                    Ok((stream, _)) = async {
-                        match listener.as_ref() {
-                            Some(l) => l.accept().await,
-                            // Listener already dropped (restart path) —
-                            // return pending so this arm never fires again
-                            None => std::future::pending().await,
-                        }
-                    } => {
-                        let server_clone = server.clone();
-                        let restart_handle = connection_handle.clone();
-                        let context = telemetry::create_context!("http.request");
-
-                        thread_pool.spawn(async move {
-                            let transport = match &server_clone.tls {
-                                None => {
-                                    let peer_addr = stream.peer_addr().unwrap();
-                                    Transport::new(stream, peer_addr)
-                                }
-                                Some(acceptor) => {
-                                    match acceptor.accept(stream).await {
-                                        Ok(tls_stream) => {
-                                            let peer_addr =
-                                                tls_stream.get_ref().0.peer_addr().unwrap();
-                                            Transport::new(tls_stream, peer_addr)
-                                        }
-                                        Err(e) => {
-                                            telemetry::warn!("TLS error: {}", e);
-                                            return;
-                                        }
-                                    }
-                                }
-                            };
-
-                            server_clone
-                                .handle_connection(transport, restart_handle)
-                                .await;
-                        }.instrument(context));
-                    }
-
                     Some(restart_req) = restart_rx.recv() => {
                         if restart_in_progress {
-                            telemetry::info!("Restart already in progress, ignoring duplicate.");
                             continue;
                         }
 
                         restart_in_progress = true;
-                        telemetry::info!("Restart triggered. Force: {}", restart_req.force);
 
                         let mut current_exe = match std::env::current_exe() {
                             Ok(exe) => exe,
-                            Err(e) => {
-                                telemetry::warn!("Failed to get executable path: {}", e);
+                            Err(_) => {
                                 restart_in_progress = false;
                                 continue;
                             }
@@ -395,20 +519,13 @@ impl HttpServer {
                                 .spawn()
                             {
                                 Ok(c) => c,
-                                Err(e) => {
-                                    telemetry::warn!("Failed to spawn new process: {}", e);
+                                Err(_) => {
                                     restart_in_progress = false;
                                     continue;
                                 }
                             };
 
                         *child_pid.lock().unwrap() = Some(child.id());
-
-                        telemetry::info!(
-                            "New process spawned (PID {}). Verifying stability for {}s...",
-                            child.id(),
-                            server.restart_stability_window.as_secs(),
-                        );
 
                         let result_tx = result_tx.clone();
                         let stability_window = server.restart_stability_window;
@@ -417,24 +534,9 @@ impl HttpServer {
                             tokio::time::sleep(stability_window).await;
 
                             match child.try_wait() {
-                                Ok(Some(status)) => {
-                                    telemetry::warn!(
-                                        "New instance crashed with status: {}",
-                                        status
-                                    );
-                                    let _ = result_tx.send(Err(()));
-                                }
-                                Ok(None) => {
-                                    telemetry::info!("New instance appears stable.");
-                                    let _ = result_tx.send(Ok(restart_req));
-                                }
-                                Err(e) => {
-                                    telemetry::warn!(
-                                        "Failed to check new instance status: {}. Aborting restart.",
-                                        e
-                                    );
-                                    let _ = result_tx.send(Err(()));
-                                }
+                                Ok(Some(_)) => { let _ = result_tx.send(Err(())); }
+                                Ok(None)    => { let _ = result_tx.send(Ok(restart_req)); }
+                                Err(_)      => { let _ = result_tx.send(Err(())); }
                             }
                         });
                     }
@@ -442,13 +544,10 @@ impl HttpServer {
                     result = result_rx.recv() => {
                         match result {
                             Some(Ok(restart_req)) => {
-                                telemetry::info!("New instance stable. Dropping listener...");
-
-                                // Drop listener — OS immediately stops routing new
-                                // connections to this process via SO_REUSEPORT.
-                                // New connections go to the new process cleanly.
-                                // No client gets a connection reset.
-                                drop(listener.take());
+                                // Stop accepting — SO_REUSEPORT immediately routes
+                                // new connections to the new process. In-flight
+                                // requests continue on the free connection tasks.
+                                accept_pool.abort_all();
 
                                 let ctx = RestartContext {
                                     active_requests: server.active_requests
@@ -457,39 +556,17 @@ impl HttpServer {
                                         .collect(),
                                 };
 
-                                telemetry::info!(
-                                    "Running pre-hook with {} active requests in flight...",
-                                    ctx.active_requests.len()
-                                );
-
                                 match tokio::time::timeout(
                                     server.restart_pre_hook_timeout,
                                     (restart_req.pre_hook)(ctx),
                                 ).await {
-                                    Ok(_) => {
-                                        telemetry::info!("Pre-hook complete. Handing over.");
-                                    }
-                                    Err(_) => {
-                                        telemetry::warn!(
-                                            "Pre-hook timed out after {}s. Proceeding with handover.",
-                                            server.restart_pre_hook_timeout.as_secs()
-                                        );
-                                    }
+                                    Ok(_) => {}
+                                    Err(_) => {}
                                 }
 
                                 break restart_req.force;
                             }
-                            Some(Err(_)) => {
-                                telemetry::warn!(
-                                    "Restart failed. Unlocking for future attempts."
-                                );
-                                *child_pid.lock().unwrap() = None;
-                                restart_in_progress = false;
-                            }
-                            None => {
-                                telemetry::warn!(
-                                    "Result channel closed unexpectedly. Unlocking."
-                                );
+                            Some(Err(_)) | None => {
                                 *child_pid.lock().unwrap() = None;
                                 restart_in_progress = false;
                             }
@@ -499,10 +576,6 @@ impl HttpServer {
                     _ = tokio::signal::ctrl_c() => {
                         if restart_in_progress {
                             if let Some(pid) = *child_pid.lock().unwrap() {
-                                telemetry::warn!(
-                                    "SIGINT received during restart. Killing child PID {}.",
-                                    pid
-                                );
                                 #[cfg(unix)]
                                 unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL); }
                                 #[cfg(not(unix))]
@@ -513,7 +586,7 @@ impl HttpServer {
                                 }
                             }
                         }
-                        telemetry::info!("SIGINT received. Graceful shutdown.");
+                        accept_pool.abort_all();
                         break false;
                     }
 
@@ -525,10 +598,6 @@ impl HttpServer {
                     } => {
                         if restart_in_progress {
                             if let Some(pid) = *child_pid.lock().unwrap() {
-                                telemetry::warn!(
-                                    "SIGTERM received during restart. Killing child PID {}.",
-                                    pid
-                                );
                                 #[cfg(unix)]
                                 unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL); }
                                 #[cfg(not(unix))]
@@ -539,25 +608,22 @@ impl HttpServer {
                                 }
                             }
                         }
-                        telemetry::info!("SIGTERM received. Graceful shutdown.");
+                        accept_pool.abort_all();
                         break false;
                     }
                 }
             };
 
-            // Drop listener if still held (SIGINT/SIGTERM paths)
-            drop(listener.take());
-
-            if force {
-                telemetry::info!("Force shutdown. Aborting active tasks.");
-                thread_pool.abort_all();
-            } else {
-                telemetry::info!("Graceful shutdown. Waiting for active requests.");
+            // ── Drain & Exit ────────────────────────────────────────────────────────
+            //
+            // force=true  → exit immediately; OS kills every task and connection.
+            // force=false → wait until every active request completes, then exit.
+            //               Idle keep-alive connections are terminated by the OS on
+            //               exit, matching standard graceful-restart semantics.
+            if !force {
                 server.active_requests.wait_for_zero().await;
-                while thread_pool.join_next().await.is_some() {}
             }
 
-            telemetry::info!("Shutdown complete.");
             std::process::exit(0);
         };
 
@@ -566,7 +632,7 @@ impl HttpServer {
 
     async fn handle_connection(&self, mut transport: Transport, restart_handle: RestartHandle) {
         loop {
-            let request_id = Uuid::new_v4();
+            let request_id = fast_request_id();
 
             match self
                 .handle_single_request(transport, request_id, restart_handle.clone())
@@ -659,24 +725,31 @@ impl HttpServer {
 
         // ── Response hook (telemetry / on_request_complete) ────────────
         {
-            let g = guard.clone();
-            let on_complete = self.on_request_complete.clone();
-            call.set_response_hook(Arc::new(move |status_code| {
-                g.update(|info| {
-                    info.set_response_status(status_code.clone());
-                    info.mark_as_end();
-                });
-                if let Some(on_request_complete) = &on_complete
-                    && let Some(info) = g.value()
-                {
-                    let fut = on_request_complete({
-                        let mut info = info.clone();
-                        info.set_response_status(status_code);
-                        info
+            if self.on_request_complete.is_some() {
+                let g = guard.clone();
+                let on_complete = self.on_request_complete.clone();
+                call.set_response_hook(Arc::new(move |status_code| {
+                    g.update(|info| {
+                        info.set_response_status(status_code.clone());
+                        info.mark_as_end();
                     });
-                    telemetry::spawn!(fut);
-                }
-            }));
+                    if let Some(cb) = &on_complete
+                        && let Some(info) = g.value()
+                    {
+                        // Note: you also have a latent bug here — this future is
+                        // created and immediately dropped, never executed.
+                        // It needs tokio::spawn(cb(...)) to actually fire.
+                        tokio::spawn(cb({
+                            let mut i = info.clone();
+                            i.set_response_status(status_code);
+                            i
+                        }));
+                    }
+                }));
+            } else {
+                // Guard still drops at end of scope — wait_for_zero() works correctly.
+                // We just skip the Arc alloc and the hook dispatch.
+            }
         }
 
         // ── HEAD suppression ───────────────────────────────────────────
@@ -686,7 +759,7 @@ impl HttpServer {
         }
 
         // ── Route matching ─────────────────────────────────────────────
-        let route = match self.routes.iter().find(|route| {
+        let route = match self.router.iter().find(|route| {
             let method_match = &route.method == call.request.method()
                 || (is_head && route.method == HttpMethod::GET);
             route.route.is_match(call.request.route()) && method_match
@@ -695,7 +768,7 @@ impl HttpServer {
             None => {
                 let mut allowed_methods = Vec::new();
 
-                for route in &self.routes {
+                for route in &self.router {
                     if route.route.is_match(call.request.route()) {
                         allowed_methods.push(route.method.to_string());
                     }
@@ -729,8 +802,6 @@ impl HttpServer {
                 return self.finish(call.connection, keep_alive).await;
             }
         };
-
-        call.request.parse_params(&route.route);
 
         // ── Middleware ─────────────────────────────────────────────────
         for middleware in route.middleware.iter() {
@@ -859,34 +930,43 @@ impl HttpServerBuilder {
             socket2::Domain::IPV4
         };
 
-        let socket = Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
-            .map_err(|_| HttpServerError::AddrInUse(self.port))?;
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let mut listeners = Vec::new();
 
-        socket.set_reuse_address(true).unwrap_or(());
-        #[cfg(target_family = "unix")]
-        socket.set_reuse_port(true).unwrap_or(());
+        for _ in 0..cores {
+            let socket = Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
+                .map_err(|_| HttpServerError::AddrInUse(self.port))?;
 
-        socket
-            .bind(&addr.into())
-            .map_err(|_| HttpServerError::AddrInUse(self.port))?;
-        socket
-            .listen(1024)
-            .map_err(|_| HttpServerError::AddrInUse(self.port))?;
-        socket.set_nonblocking(true).unwrap_or(());
-        socket.set_tcp_nodelay(true).unwrap_or(());
-        socket.set_recv_buffer_size(256 * 1024).unwrap_or(());
-        socket.set_send_buffer_size(256 * 1024).unwrap_or(());
-        socket
-            .set_tcp_keepalive(
-                &socket2::TcpKeepalive::new()
-                    .with_time(std::time::Duration::from_secs(60))
-                    .with_interval(std::time::Duration::from_secs(10)),
-            )
-            .unwrap_or(());
+            socket.set_reuse_address(true).unwrap_or(());
+            #[cfg(target_family = "unix")]
+            socket.set_reuse_port(true).unwrap_or(());
 
-        let std_listener: std::net::TcpListener = socket.into();
-        let listener = TcpListener::from_std(std_listener)
-            .map_err(|_| HttpServerError::AddrInUse(self.port))?;
+            socket
+                .bind(&addr.into())
+                .map_err(|_| HttpServerError::AddrInUse(self.port))?;
+            socket
+                .listen(1024)
+                .map_err(|_| HttpServerError::AddrInUse(self.port))?;
+            socket.set_nonblocking(true).unwrap_or(());
+            socket.set_tcp_nodelay(true).unwrap_or(());
+            socket.set_recv_buffer_size(256 * 1024).unwrap_or(());
+            socket.set_send_buffer_size(256 * 1024).unwrap_or(());
+            socket
+                .set_tcp_keepalive(
+                    &socket2::TcpKeepalive::new()
+                        .with_time(std::time::Duration::from_secs(60))
+                        .with_interval(std::time::Duration::from_secs(10)),
+                )
+                .unwrap_or(());
+
+            let std_listener: std::net::TcpListener = socket.into();
+            let listener = TcpListener::from_std(std_listener)
+                .map_err(|_| HttpServerError::AddrInUse(self.port))?;
+
+            listeners.push(listener);
+        }
 
         let tls = if let Some(tls_config) = self.tls_config {
             let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -896,9 +976,9 @@ impl HttpServerBuilder {
         };
 
         Ok(HttpServer {
-            routes: self.routes,
-            listener: Some(listener),
-            active_requests: ActiveRequest::new(),
+            router: self.routes,
+            listeners,
+            active_requests: ActiveSet::new_with_telemetry(self.on_request_complete.is_some()),
             on_request_complete: self.on_request_complete,
             cors: self.cors,
             tls,

@@ -1,15 +1,13 @@
 use crate::body::Body;
 use crate::cookie_store::CookieStore;
 use crate::field_lines::FieldLines;
-use crate::transport::Transport;
 use bytes::Bytes;
 use regex::Regex;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
-use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use std::sync::{Arc, OnceLock};
 
 #[derive(thiserror::Error, Debug)]
 pub enum HttpRequestError {
@@ -122,7 +120,7 @@ impl HttpParam {
             .collect()
     }
 
-    fn parse_query_params(url: &str) -> HashMap<Arc<str>, Arc<str>> {
+    pub(crate) fn parse_query_params(url: &str) -> HashMap<Arc<str>, Arc<str>> {
         let query = url.split_once('?').map(|(_, q)| q).unwrap_or("");
 
         form_urlencoded::parse(query.as_bytes()).into_owned().fold(
@@ -135,23 +133,34 @@ impl HttpParam {
     }
 }
 
+pub(crate) enum BodyState {
+    Unread {
+        content_length: usize,
+        is_chunked: bool,
+    },
+    Reading,
+    Read(Body),
+}
+
 pub(crate) struct HttpRequest {
     client_ipv4_address: Option<Ipv4Addr>,
     client_ipv6_address: Option<Ipv6Addr>,
     host: Option<Arc<str>>,
     http_version: Bytes,
     method: HttpMethod,
-    route: Arc<str>,
+    pub(crate) route: Arc<str>,
     field_lines: FieldLines,
-    path_params: HashMap<Arc<str>, Arc<str>>,
-    query_params: HashMap<Arc<str>, Arc<str>>,
-    body: Body,
     cookies: CookieStore,
+    pub(crate) max_body_size: usize,
+    pub(crate) body_state: BodyState,
+    pub(crate) matched_route_regex: Option<Regex>,
+    pub(crate) path_params: OnceLock<HashMap<Arc<str>, Arc<str>>>,
+    pub(crate) query_params: OnceLock<HashMap<Arc<str>, Arc<str>>>,
 }
 
 impl HttpRequest {
-    pub(crate) async fn parse(
-        reader: &mut BufReader<&mut Transport>,
+    pub(crate) fn parse(
+        header_bytes: Bytes,
         peer_addr: SocketAddr,
         max_body_size: usize,
     ) -> Result<Self, HttpRequestError> {
@@ -160,77 +169,46 @@ impl HttpRequest {
             IpAddr::V6(ip) => (None, Some(ip)),
         };
 
-        let request_line = {
-            let mut buf: Vec<u8> = Vec::new();
-            let bytes_to_read = match reader.read_until(b'\n', &mut buf).await {
-                Ok(size) => size,
-                Err(_) => {
-                    return Err(HttpRequestError::HeaderParsingFailed(
-                        "Failed to parse request line".into(),
-                    ));
-                }
-            };
+        // SIMD search for the end of the request line (Extremely fast)
+        let req_line_end = memchr::memchr(b'\n', &header_bytes).ok_or(
+            HttpRequestError::RequestLineParsingFailed("Missing request line".into()),
+        )?;
 
-            if bytes_to_read == 0 {
-                return Err(HttpRequestError::HeaderParsingFailed(
-                    "Stream closed before request line could be parsed".into(),
-                ));
+        // Parse Request Line without holding onto `Bytes` references
+        let (method, route, http_version) = {
+            let mut line = &header_bytes[..req_line_end];
+            if line.last() == Some(&b'\r') {
+                line = &line[..line.len() - 1];
             }
 
-            if buf.len() > 8192 {
-                return Err(HttpRequestError::RequestLineTooLong);
-            }
+            let first_space = memchr::memchr(b' ', line).ok_or(
+                HttpRequestError::RequestLineParsingFailed("Missing HTTP method".into()),
+            )?;
+            let after_method = first_space + 1;
 
-            match Self::parse_request_line(buf) {
-                Ok(v) => v,
-                Err(e) => {
-                    return Err(HttpRequestError::RequestLineParsingFailed(format!(
-                        "Failed to parse request line: {}",
-                        e
-                    )));
-                }
-            }
+            let second_space_rel = memchr::memchr(b' ', &line[after_method..]).ok_or(
+                HttpRequestError::RequestLineParsingFailed("Missing route".into()),
+            )?;
+            let second_space = after_method + second_space_rel;
+
+            let version_start = second_space + 1;
+
+            let m_str = std::str::from_utf8(&line[0..first_space]).unwrap_or("");
+            let method = HttpMethod::from_str(m_str).unwrap_or(HttpMethod::GET);
+
+            let r_str = std::str::from_utf8(&line[after_method..second_space]).unwrap_or("");
+            let route = Arc::from(r_str);
+
+            // CRITICAL FIX: Copy the 8 tiny bytes so `header_bytes` can be fully dropped later!
+            let version = Bytes::copy_from_slice(&line[version_start..]);
+
+            (method, route, version)
         };
 
-        let field_lines = {
-            let mut buffer = Vec::new();
-            loop {
-                let bytes_to_read = match reader.read_until(b'\n', &mut buffer).await {
-                    Ok(size) => size,
-                    Err(_) => {
-                        return Err(HttpRequestError::HeaderParsingFailed(
-                            "Unable to parse header".into(),
-                        ));
-                    }
-                };
+        // Parse headers. FieldLines::from uses &[u8] and copies into its own Strings.
+        let field_lines = FieldLines::from(&header_bytes[req_line_end + 1..]);
 
-                if bytes_to_read == 0 {
-                    return Err(HttpRequestError::HeaderParsingFailed(
-                        "Stream closed before header could be parsed".into(),
-                    ));
-                }
-
-                if buffer.len() > 64 * 1024 {
-                    return Err(HttpRequestError::HeadersTooLarge);
-                }
-
-                if buffer.ends_with(b"\r\n\r\n") {
-                    break;
-                }
-            }
-
-            FieldLines::from(buffer.as_slice())
-        };
-
-        let host = field_lines
-            .get("host")
-            .map(|h| Arc::from(h.trim()))
-            .or(None);
-
-        let content_type = field_lines
-            .get("content-type")
-            .unwrap_or_default()
-            .to_owned();
+        let host = field_lines.get("host").map(|h| Arc::from(h.trim()));
 
         let content_length = field_lines
             .get("content-length")
@@ -238,90 +216,41 @@ impl HttpRequest {
             .parse::<usize>()
             .unwrap_or(0);
 
-        if field_lines
-            .get("expect")
-            .map(|v| v.eq_ignore_ascii_case("100-continue"))
-            .unwrap_or(false)
-        {
-            if content_length > max_body_size {
-                return Err(HttpRequestError::PayloadTooLarge);
-            }
-
-            // Confirm we'll accept the body
-            reader
-                .get_mut()
-                .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
-                .await
-                .map_err(|e| {
-                    HttpRequestError::RequestParsingFailed(format!(
-                        "Failed to send 100 Continue: {e}"
-                    ))
-                })?;
-
-            reader.get_mut().flush().await.map_err(|e| {
-                HttpRequestError::RequestParsingFailed(format!("Failed to flush 100 Continue: {e}"))
-            })?;
-        }
-
         let is_chunked = field_lines
             .get("transfer-encoding")
             .map(|v| v.contains("chunked"))
             .unwrap_or(false);
 
-        let body = if is_chunked {
-            match Body::read_chunked(reader, max_body_size, Some(content_type)).await {
-                Ok(v) => v,
-                Err(e) => {
-                    return match e.as_str() {
-                        "body too large" => Err(HttpRequestError::PayloadTooLarge),
-                        err => Err(HttpRequestError::BodyParsingFailed(err.to_string())),
-                    };
-                }
-            }
-        } else {
-            match Body::read_exact(reader, content_length, max_body_size, Some(content_type)).await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    return match e.as_str() {
-                        "body too large" => Err(HttpRequestError::PayloadTooLarge),
-                        err => Err(HttpRequestError::BodyParsingFailed(err.to_string())),
-                    };
-                }
-            }
-        };
+        if content_length > max_body_size {
+            return Err(HttpRequestError::PayloadTooLarge);
+        }
 
         let cookies = match field_lines.get("cookie") {
             Some(cookie_header_value) => CookieStore::from(cookie_header_value.as_bytes()),
             None => CookieStore::new(),
         };
 
+        // -> `header_bytes` drops here! Tokio reclaims the 8KB pool instantly! <-
+
         Ok(Self {
             client_ipv4_address,
             client_ipv6_address,
             host,
-            method: match HttpMethod::from_str(str::from_utf8(&request_line.0).unwrap_or("")) {
-                Ok(v) => v,
-                Err(_) => {
-                    return Err(HttpRequestError::RequestParsingFailed(
-                        "Failed to parse HTTP method".into(),
-                    ));
-                }
-            },
-            route: match String::from_utf8(request_line.1.to_vec()) {
-                Ok(s) => Arc::from(s),
-                Err(_) => {
-                    return Err(HttpRequestError::RequestParsingFailed(
-                        "Failed to parse route".into(),
-                    ));
-                }
-            },
-            http_version: request_line.2,
+            method,
+            route,
+            http_version,
             field_lines,
-            path_params: HashMap::new(),
-            query_params: HashMap::new(),
-            body,
             cookies,
+            max_body_size,
+
+            // Lazy evaluations
+            body_state: BodyState::Unread {
+                content_length,
+                is_chunked,
+            },
+            matched_route_regex: None,
+            path_params: std::sync::OnceLock::new(),
+            query_params: std::sync::OnceLock::new(),
         })
     }
 
@@ -355,76 +284,5 @@ impl HttpRequest {
 
     pub(crate) fn method(&self) -> &HttpMethod {
         &self.method
-    }
-
-    pub(crate) fn parse_params(&mut self, route_regex: &Regex) {
-        self.path_params = HttpParam::parse_path_params(route_regex, &self.route);
-        self.query_params = HttpParam::parse_query_params(&self.route);
-    }
-
-    pub(crate) fn path_param<K>(&self, param_name: K) -> Option<&str>
-    where
-        K: Into<String>,
-    {
-        self.path_params
-            .get(param_name.into().as_str())
-            .map(|v| v.as_ref())
-    }
-
-    pub(crate) fn query_param<K>(&self, param_name: K) -> Option<&str>
-    where
-        K: Into<String>,
-    {
-        self.query_params
-            .get(param_name.into().as_str())
-            .map(|v| v.as_ref())
-    }
-
-    pub(crate) fn body(&self) -> &Body {
-        &self.body
-    }
-
-    fn parse_request_line(buf: Vec<u8>) -> Result<(Bytes, Bytes, Bytes), &'static str> {
-        let bytes = Bytes::from(buf);
-        let mut end = bytes.len();
-
-        if end > 0 && bytes[end - 1] == b'\n' {
-            end -= 1;
-        }
-        if end > 0 && bytes[end - 1] == b'\r' {
-            end -= 1;
-        }
-
-        let line = bytes.slice(0..end);
-
-        let first_space = memchr::memchr(b' ', line.as_ref()).ok_or("missing HTTP method")?;
-        if first_space == 0 {
-            return Err("missing HTTP method");
-        }
-
-        let after_method = first_space + 1;
-        if after_method >= line.len() {
-            return Err("malformed request line");
-        }
-        let rest = &line[after_method..];
-        let second_space_rel = memchr::memchr(b' ', rest).ok_or("missing route")?;
-        if second_space_rel == 0 {
-            return Err("missing route");
-        }
-        let second_space = after_method + second_space_rel;
-
-        let version_start = second_space + 1;
-        if version_start > line.len() {
-            return Err("malformed request line");
-        }
-        if version_start == line.len() {
-            return Err("missing HTTP version");
-        }
-
-        let method = line.slice(0..first_space);
-        let route = line.slice(after_method..second_space);
-        let version = line.slice(version_start..line.len());
-
-        Ok((method, route, version))
     }
 }

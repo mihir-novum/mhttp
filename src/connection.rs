@@ -39,7 +39,8 @@ fn get_date_header() -> String {
 }
 
 pub(crate) struct Connection {
-    writer: BufWriter<Transport>,
+    pub(crate)  writer: BufWriter<Transport>,
+    pub(crate) reader: BytesMut,
     has_written_response: bool,
     keep_alive: bool,
     keep_alive_timeout_secs: u64,
@@ -49,6 +50,7 @@ impl Connection {
     pub(crate) fn new(transport: Transport) -> Self {
         Self {
             writer: BufWriter::with_capacity(8 * 1024, transport),
+            reader: BytesMut::with_capacity(8 * 1024),
             has_written_response: false,
             keep_alive: true,
             keep_alive_timeout_secs: 75,
@@ -70,42 +72,52 @@ impl Connection {
         keep_alive_timeout: std::time::Duration,
         request_timeout: std::time::Duration,
     ) -> Result<Option<HttpRequest>, HttpRequestError> {
-        let transport = self.writer.get_mut();
-        let peer_addr = transport.peer_addr();
+        let peer_addr = self.writer.get_ref().peer_addr();
 
-        let mut reader = BufReader::new(transport);
+        // ── STAGE 1: Idle Timeout ──
+        if self.reader.is_empty() {
+            // Reserve reclaims memory if `header_bytes` was dropped properly!
+            if self.reader.capacity() < 4096 {
+                self.reader.reserve(8192);
+            }
 
-        // =====================================================================
-        // STAGE 1: IDLE TIMEOUT (Keep-Alive)
-        // Wait for the client to send the first byte. `fill_buf` pulls data
-        // into the reader but does NOT consume it.
-        // =====================================================================
-        match tokio::time::timeout(keep_alive_timeout, reader.fill_buf()).await {
-            Ok(Ok(buf)) if buf.is_empty() => {
-                // EOF reached: Client cleanly closed the connection.
-                return Ok(None);
-            }
-            Ok(Ok(_)) => {
-                // Success: We see bytes! The client has started talking.
-            }
-            Ok(Err(e)) => return Err(HttpRequestError::Io(e)),
-            Err(_) => {
-                // Timeout: The client sat idle for 75 seconds. Close cleanly.
-                return Ok(None);
+            match tokio::time::timeout(
+                keep_alive_timeout,
+                self.writer.get_mut().read_buf(&mut self.reader)
+            ).await {
+                Ok(Ok(0)) | Err(_) => return Ok(None),
+                Ok(Ok(_)) => {},
+                Ok(Err(e)) => return Err(HttpRequestError::Io(e)),
             }
         }
 
-        // =====================================================================
-        // STAGE 2: PARSE TIMEOUT (Request Timeout)
-        // The client is actively talking. Enforce a hard 60-second limit to
-        // parse the headers and body to prevent Slowloris attacks.
-        // =====================================================================
-        match tokio::time::timeout(
-            request_timeout,
-            HttpRequest::parse(&mut reader, peer_addr, max_body_size),
-        )
-        .await
-        {
+        // ── STAGE 2: Parse Request ──
+        let parse_future = async {
+            loop {
+                // SIMD search for the end of the headers
+                if let Some(pos) = memchr::memmem::find(&self.reader, b"\r\n\r\n") {
+                    let header_len = pos + 4;
+                    // O(1) split. Leaves pipelined requests intact for the next loop!
+                    let header_bytes = self.reader.split_to(header_len).freeze();
+                    return HttpRequest::parse(header_bytes, peer_addr, max_body_size);
+                }
+
+                if self.reader.len() > 64 * 1024 {
+                    return Err(HttpRequestError::HeadersTooLarge);
+                }
+
+                if self.reader.capacity() < 4096 {
+                    self.reader.reserve(8192);
+                }
+
+                let n = self.writer.get_mut().read_buf(&mut self.reader).await.map_err(HttpRequestError::Io)?;
+                if n == 0 {
+                    return Err(HttpRequestError::HeaderParsingFailed("EOF before headers finished".into()));
+                }
+            }
+        };
+
+        match tokio::time::timeout(request_timeout, parse_future).await {
             Ok(Ok(req)) => Ok(Some(req)),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(HttpRequestError::Timeout),

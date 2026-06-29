@@ -12,6 +12,7 @@ mod server;
 pub mod static_files;
 mod tls;
 mod transport;
+mod router;
 
 pub use request::HttpMethod;
 pub use response::{HttpResponseInit, HttpResponseReady, HttpStatusCode};

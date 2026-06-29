@@ -26,7 +26,7 @@ const RESERVED_HEADERS: &[&str] = &[
     "connection",
     "keep-alive",
     "content-range",
-    "accept-ranges"
+    "accept-ranges",
 ];
 
 #[derive(Debug, Clone)]
@@ -325,43 +325,44 @@ impl<State> HttpResponse<State> {
         self
     }
 
-    pub fn add_header<K: Into<String>, V: Into<String>>(
+    pub fn add_header<K: AsRef<str>, V: AsRef<str>>(
         mut self,
         field_name: K,
         field_value: V,
     ) -> Self {
-        let field_name = field_name.into();
+        let field_name = field_name.as_ref();
         if !RESERVED_HEADERS
             .iter()
             .any(|h| field_name.eq_ignore_ascii_case(h))
         {
-            self.field_lines.set(field_name, field_value.into());
+            self.field_lines.set(field_name, field_value.as_ref());
         }
         self
     }
 
-    pub(crate) fn __add_header_internal<K: Into<String>, V: Into<String>>(
+    pub(crate) fn __add_header_internal<K: AsRef<str>, V: AsRef<str>>(
         mut self,
         field_name: K,
         field_value: V,
     ) -> Self {
-        self.field_lines.set(field_name.into(), field_value.into());
+        self.field_lines
+            .set(field_name.as_ref(), field_value.as_ref());
         self
     }
 
-    pub fn remove_header<S: Into<String>>(mut self, field_name: S) -> Self {
-        let field_name = field_name.into();
+    pub fn remove_header<S: AsRef<str>>(mut self, field_name: S) -> Self {
+        let field_name = field_name.as_ref();
         if !RESERVED_HEADERS
             .iter()
             .any(|h| field_name.eq_ignore_ascii_case(h))
         {
-            self.field_lines.remove(field_name.as_str());
+            self.field_lines.remove(field_name);
         }
         self
     }
 
-    pub(crate) fn __remove_header_internal<S: Into<String>>(mut self, field_name: S) -> Self {
-        self.field_lines.remove(field_name.into().as_str());
+    pub(crate) fn __remove_header_internal<S: AsRef<str>>(mut self, field_name: S) -> Self {
+        self.field_lines.remove(field_name.as_ref());
         self
     }
 
@@ -402,12 +403,12 @@ impl<'a> HttpResponseInit<'a> {
         self
     }
 
-    pub fn add_header<K: Into<String>, V: Into<String>>(mut self, k: K, v: V) -> Self {
+    pub fn add_header<K: AsRef<str>, V: AsRef<str>>(mut self, k: K, v: V) -> Self {
         self.response = self.response.add_header(k, v);
         self
     }
 
-    pub(crate) fn __add_header_internal<K: Into<String>, V: Into<String>>(
+    pub(crate) fn __add_header_internal<K: AsRef<str>, V: AsRef<str>>(
         mut self,
         k: K,
         v: V,
@@ -416,12 +417,12 @@ impl<'a> HttpResponseInit<'a> {
         self
     }
 
-    pub fn remove_header<K: Into<String>>(mut self, name: K) -> Self {
+    pub fn remove_header<K: AsRef<str>>(mut self, name: K) -> Self {
         self.response = self.response.remove_header(name);
         self
     }
 
-    pub(crate) fn __remove_header_internal<K: Into<String>>(mut self, name: K) -> Self {
+    pub(crate) fn __remove_header_internal<K: AsRef<str>>(mut self, name: K) -> Self {
         self.response = self.response.__remove_header_internal(name);
         self
     }
@@ -490,7 +491,7 @@ impl<'a> HttpResponseReady<'a> {
         self
     }
 
-    pub fn add_header<K: Into<String>, V: Into<String>>(mut self, k: K, v: V) -> Self {
+    pub fn add_header<K: AsRef<str>, V: AsRef<str>>(mut self, k: K, v: V) -> Self {
         self.response = self.response.add_header(k, v);
         self
     }
