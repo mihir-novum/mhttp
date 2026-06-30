@@ -13,7 +13,6 @@ use crate::transport::Transport;
 use crate::{HttpMethod, HttpStatusCode};
 use bytes::Bytes;
 use socket2::Socket;
-use std::cell::Cell;
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
@@ -34,36 +33,6 @@ pub enum HttpServerError {
     Tls(#[from] TlsConfigError),
 }
 
-fn fast_request_id() -> Uuid {
-    // Thread-local: no atomic CAS, no cross-core cache invalidation.
-    thread_local! {
-        // Upper 32 bits = stable thread identifier seeded once.
-        static THREAD_SEED: u64 = {
-            use std::hash::{Hash, Hasher, DefaultHasher};
-            let mut h = DefaultHasher::new();
-            std::thread::current().id().hash(&mut h);
-            (h.finish() & 0xFFFF_FFFF) << 32
-        };
-        static SEQ: Cell<u32> = Cell::new(0);
-    }
-
-    let hi = THREAD_SEED.with(|&seed| {
-        let s = SEQ.with(|c| {
-            let v = c.get();
-            c.set(v.wrapping_add(1));
-            v
-        });
-        seed | s as u64
-    });
-
-    // Lower 64 bits: nanosecond timestamp for rough chronological ordering.
-    let lo = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos() as u64;
-
-    Uuid::from_u64_pair(hi, lo)
-}
 
 pub struct RestartContext {
     pub active_requests: Vec<RequestInfo>,
@@ -629,7 +598,7 @@ impl HttpServer {
 
     async fn handle_connection(&self, mut transport: Transport, restart_handle: RestartHandle) {
         loop {
-            let request_id = fast_request_id();
+            let request_id = Uuid::new_v4();
 
             match self
                 .handle_single_request(transport, request_id, restart_handle.clone())
