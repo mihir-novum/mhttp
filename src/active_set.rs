@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::{
-    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
 };
 use tokio::sync::Notify;
 
@@ -14,11 +14,22 @@ struct Inner<Id, Info> {
     count: AtomicUsize,
     empty_notify: Notify,
     // None when telemetry is disabled.
-    // The hot path (insert + drop) never touches this pointer.
+    // The hot path (insert + drop) never touches this pointer if telemetry is off.
     map: Option<Mutex<HashMap<Id, Info>>>,
 }
 
+/// The public guard that can be freely and safely cloned.
 pub struct ActiveGuard<Id, Info>
+where
+    Id: Eq + Hash,
+{
+    // The inner Arc ensures that no matter how many times this guard is cloned,
+    // the actual Drop logic only executes exactly ONCE when the last clone drops.
+    drop_guard: Arc<GuardDrop<Id, Info>>,
+}
+
+/// A private helper struct that strictly manages the Drop lifecycle.
+struct GuardDrop<Id, Info>
 where
     Id: Eq + Hash,
 {
@@ -57,23 +68,19 @@ where
     }
 
     pub fn insert(&self, id: Id, info: Info) -> ActiveGuard<Id, Info> {
-        // When map is None: one atomic add. No lock, no allocation, no cache-line
-        // bounce across cores. This is the entire hot-path cost.
-        //
-        // When map is Some: one mutex lock (still uncontended in typical use,
-        // because map ops only happen when telemetry is wired up).
+        // ALWAYS increment the graceful shutdown counter unconditionally
+        self.inner.count.fetch_add(1, Ordering::Relaxed);
+
+        // OPTIONALLY insert into telemetry map (only taking the lock if map exists)
         if let Some(map) = &self.inner.map {
-            let is_new = map.lock().unwrap().insert(id.clone(), info).is_none();
-            if is_new {
-                self.inner.count.fetch_add(1, Ordering::Relaxed);
-            }
-        } else {
-            self.inner.count.fetch_add(1, Ordering::Relaxed);
+            map.lock().unwrap().insert(id.clone(), info);
         }
 
         ActiveGuard {
-            inner: self.inner.clone(),
-            id,
+            drop_guard: Arc::new(GuardDrop {
+                inner: self.inner.clone(),
+                id,
+            }),
         }
     }
 
@@ -115,11 +122,7 @@ where
     pub async fn wait_for_zero(&self) {
         loop {
             // Register the listener BEFORE loading the counter.
-            // Closes the race window from the original implementation:
-            //
-            //   old:  load (not zero) ... [last drop fires, notify sent] ... .await (hangs)
-            //   new:  enable() registers listener ... load (not zero) ... .await (woken)
-            //
+            // Closes the race window perfectly.
             let notified = self.inner.empty_notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
@@ -142,63 +145,66 @@ where
     Info: Clone,
 {
     pub fn id(&self) -> &Id {
-        &self.id
+        &self.drop_guard.id
     }
 
     pub fn update(&self, f: impl FnOnce(&mut Info)) {
-        if let Some(map) = &self.inner.map {
-            if let Some(info) = map.lock().unwrap().get_mut(&self.id) {
+        if let Some(map) = &self.drop_guard.inner.map {
+            if let Some(info) = map.lock().unwrap().get_mut(&self.drop_guard.id) {
                 f(info);
             }
         }
     }
 
     pub fn value(&self) -> Option<Info> {
-        self.inner
+        self.drop_guard
+            .inner
             .map
             .as_ref()?
             .lock()
             .unwrap()
-            .get(&self.id)
+            .get(&self.drop_guard.id)
             .cloned()
     }
 }
 
+// ✨ Safe Cloning: Only increments the Arc counter. `Id` no longer needs to be cloned!
 impl<Id, Info> Clone for ActiveGuard<Id, Info>
 where
-    Id: Clone + Eq + Hash,
+    Id: Eq + Hash,
 {
     fn clone(&self) -> Self {
         Self {
-            inner: self.inner.clone(),
-            id: self.id.clone(),
+            drop_guard: self.drop_guard.clone(),
         }
     }
 }
 
-impl<Id, Info> Drop for ActiveGuard<Id, Info>
+// ✨ Exactly-Once Drop Logic
+impl<Id, Info> Drop for GuardDrop<Id, Info>
 where
     Id: Eq + Hash,
 {
     fn drop(&mut self) {
-        // Mirror of insert: skip the map on the hot path.
-        let actually_removed = if let Some(map) = &self.inner.map {
-            map.lock().unwrap().remove(&self.id).is_some()
-        } else {
-            true // counter-only mode: always decrement
-        };
+        // If telemetry is active, remove it from the map
+        if let Some(map) = &self.inner.map {
+            map.lock().unwrap().remove(&self.id);
+        }
 
-        if actually_removed {
-            // Release: guarantees map.remove() and any update() writes are
-            // visible to the Acquire load in wait_for_zero when count hits 0.
-            let prev = self.inner.count.fetch_sub(1, Ordering::Release);
-            debug_assert!(prev > 0, "count underflow — double-drop of ActiveGuard");
-            if prev == 1 {
-                self.inner.empty_notify.notify_waiters();
-            }
+        // ALWAYS decrement the counter exactly once per insert
+        // Release: guarantees map.remove() and any update() writes are
+        // visible to the Acquire load in wait_for_zero when count hits 0.
+        let prev = self.inner.count.fetch_sub(1, Ordering::Release);
+
+        debug_assert!(prev > 0, "count underflow — double-drop of ActiveGuard");
+
+        if prev == 1 {
+            self.inner.empty_notify.notify_waiters();
         }
     }
 }
+
+// ── Manual Send/Sync Bounds (Optional but kept for compatibility) ───────────
 
 unsafe impl<Id, Info> Send for ActiveSet<Id, Info>
 where

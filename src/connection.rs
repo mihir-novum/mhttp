@@ -9,38 +9,54 @@ use std::cell::RefCell;
 use std::sync::OnceLock;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 
-static CACHED_DATE: OnceLock<parking_lot::RwLock<(u64, String)>> = OnceLock::new();
 
 thread_local! {
-    static HEADER_BUF: RefCell<BytesMut> = RefCell::new(BytesMut::with_capacity(4096));
+    // 0 Locks, 0 Mutexes, Pure CPU Cache Locality
+    static CACHED_DATE: RefCell<(u64, Vec<u8>)> = RefCell::new((0, Vec::new()));
 }
 
-fn get_date_header() -> String {
-    let cache = CACHED_DATE.get_or_init(|| parking_lot::RwLock::new((0, String::new())));
+fn write_date_header(buf: &mut Vec<u8>) {
+    CACHED_DATE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
 
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-
-    {
-        let read = cache.read();
-        if read.0 == now_secs {
-            return read.1.clone();
+        if cache.0 != now_secs {
+            let formatted = chrono::Utc::now()
+                .format("%a, %d %b %Y %H:%M:%S GMT")
+                .to_string();
+            cache.0 = now_secs;
+            cache.1.clear();
+            cache.1.extend_from_slice(formatted.as_bytes());
         }
+
+        buf.extend_from_slice(b"date: ");
+        buf.extend_from_slice(&cache.1);
+        buf.extend_from_slice(b"\r\n");
+    });
+}
+
+// Zero-allocation integer formatter for Keep-Alive timeouts
+fn format_u64(mut n: u64, buf: &mut [u8; 20]) -> &[u8] {
+    if n == 0 {
+        buf[0] = b'0';
+        return &buf[..1];
     }
-
-    let formatted = chrono::Utc::now()
-        .format("%a, %d %b %Y %H:%M:%S GMT")
-        .to_string();
-
-    *cache.write() = (now_secs, formatted.clone());
-    formatted
+    let mut i = 20;
+    while n > 0 {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    &buf[i..]
 }
 
 pub(crate) struct Connection {
-    pub(crate)  writer: BufWriter<Transport>,
+    pub(crate) writer: BufWriter<Transport>,
     pub(crate) reader: BytesMut,
+    pub(crate) header_buf: Vec<u8>, // Re-used per connection (Zero Allocations!)
     has_written_response: bool,
     keep_alive: bool,
     keep_alive_timeout_secs: u64,
@@ -51,6 +67,7 @@ impl Connection {
         Self {
             writer: BufWriter::with_capacity(8 * 1024, transport),
             reader: BytesMut::with_capacity(8 * 1024),
+            header_buf: Vec::with_capacity(1024), // Pre-allocated once!
             has_written_response: false,
             keep_alive: true,
             keep_alive_timeout_secs: 75,
@@ -76,17 +93,18 @@ impl Connection {
 
         // ── STAGE 1: Idle Timeout ──
         if self.reader.is_empty() {
-            // Reserve reclaims memory if `header_bytes` was dropped properly!
             if self.reader.capacity() < 4096 {
                 self.reader.reserve(8192);
             }
 
             match tokio::time::timeout(
                 keep_alive_timeout,
-                self.writer.get_mut().read_buf(&mut self.reader)
-            ).await {
+                self.writer.get_mut().read_buf(&mut self.reader),
+            )
+                .await
+            {
                 Ok(Ok(0)) | Err(_) => return Ok(None),
-                Ok(Ok(_)) => {},
+                Ok(Ok(_)) => {}
                 Ok(Err(e)) => return Err(HttpRequestError::Io(e)),
             }
         }
@@ -97,7 +115,6 @@ impl Connection {
                 // SIMD search for the end of the headers
                 if let Some(pos) = memchr::memmem::find(&self.reader, b"\r\n\r\n") {
                     let header_len = pos + 4;
-                    // O(1) split. Leaves pipelined requests intact for the next loop!
                     let header_bytes = self.reader.split_to(header_len).freeze();
                     return HttpRequest::parse(header_bytes, peer_addr, max_body_size);
                 }
@@ -110,9 +127,22 @@ impl Connection {
                     self.reader.reserve(8192);
                 }
 
-                let n = self.writer.get_mut().read_buf(&mut self.reader).await.map_err(HttpRequestError::Io)?;
+                // ✨ PIPELINING DEADLOCK FIX:
+                // We are about to block on read. We MUST ensure any partially completed
+                // responses are flushed to the client before we block waiting for them.
+                self.writer.flush().await.map_err(HttpRequestError::Io)?;
+
+                let n = self
+                    .writer
+                    .get_mut()
+                    .read_buf(&mut self.reader)
+                    .await
+                    .map_err(HttpRequestError::Io)?;
+
                 if n == 0 {
-                    return Err(HttpRequestError::HeaderParsingFailed("EOF before headers finished".into()));
+                    return Err(HttpRequestError::HeaderParsingFailed(
+                        "EOF before headers finished".into(),
+                    ));
                 }
             }
         };
@@ -126,82 +156,91 @@ impl Connection {
 
     pub(crate) async fn write_response(
         &mut self,
-        mut response: HttpResponse<HttpResponseBodyInitialized>,
+        response: HttpResponse<HttpResponseBodyInitialized>,
     ) -> Result<(), tokio::io::Error> {
         self.has_written_response = true;
-
-        response.field_lines.set("date", get_date_header());
-
-        response.field_lines.set(
-            "connection",
-            if self.keep_alive {
-                "keep-alive"
-            } else {
-                "close"
-            },
-        );
-
-        if self.keep_alive {
-            response.field_lines.set(
-                "keep-alive",
-                format!("timeout={}", self.keep_alive_timeout_secs),
-            );
-        }
 
         let status_forbids_body = matches!(
             response.status_code,
             HttpStatusCode::NoContent | HttpStatusCode::NotModified
         );
 
+        // We build the HTTP header entirely in RAM reusing the `header_buf`
+        self.header_buf.clear();
+
+        // Write Status Line
+        self.header_buf.extend_from_slice(&response.http_version);
+        self.header_buf.extend_from_slice(b" ");
+        self.header_buf.extend_from_slice(&*response.status_code.to_bytes());
+        self.header_buf.extend_from_slice(b"\r\n");
+
+        // Write Date Header
+        write_date_header(&mut self.header_buf);
+
+        // Write Keep-Alive Headers
+        if self.keep_alive {
+            self.header_buf.extend_from_slice(b"connection: keep-alive\r\n");
+            self.header_buf.extend_from_slice(b"keep-alive: timeout=");
+
+            let mut num_buf = [0u8; 20];
+            let num_slice = format_u64(self.keep_alive_timeout_secs, &mut num_buf);
+            self.header_buf.extend_from_slice(num_slice);
+            self.header_buf.extend_from_slice(b"\r\n");
+        } else {
+            self.header_buf.extend_from_slice(b"connection: close\r\n");
+        }
+
+        // Write Content-Length zero dynamically if missing
         if !status_forbids_body
             && response.body.is_none()
             && response.field_lines.get("content-length").is_none()
         {
-            response.field_lines.set("content-length", "0");
+            self.header_buf.extend_from_slice(b"content-length: 0\r\n");
         }
 
-        let status_code = response.status_code.clone();
-        let status_bytes = response.status_code.to_bytes();
-
-        let header_bytes = HEADER_BUF.with(|cell| {
-            let mut buf = cell.borrow_mut();
-            buf.clear();
-
-            buf.put_slice(&response.http_version);
-            buf.put_slice(b" ");
-            buf.put_slice(&status_bytes);
-            buf.put_slice(b"\r\n");
-
-            for (field_name, field_value) in response.field_lines.iter() {
-                buf.put_slice(field_name.as_bytes());
-                buf.put_slice(b": ");
-                buf.put_slice(field_value.as_bytes());
-                buf.put_slice(b"\r\n");
+        // Write User Headers
+        for (field_name, field_value) in response.field_lines.iter() {
+            // Prevent duplicate injected headers
+            if field_name.eq_ignore_ascii_case("date")
+                || field_name.eq_ignore_ascii_case("connection")
+                || field_name.eq_ignore_ascii_case("keep-alive")
+            {
+                continue;
             }
+            self.header_buf.extend_from_slice(field_name.as_bytes());
+            self.header_buf.extend_from_slice(b": ");
+            self.header_buf.extend_from_slice(field_value.as_bytes());
+            self.header_buf.extend_from_slice(b"\r\n");
+        }
 
-            if let Some(store) = &response.cookies {
-                let bytes = store.to_bytes();
-                if !bytes.is_empty() {
-                    buf.put_slice(&bytes);
-                }
+        if let Some(store) = &response.cookies {
+            let bytes = store.to_bytes();
+            if !bytes.is_empty() {
+                self.header_buf.extend_from_slice(&bytes);
             }
+        }
 
-            buf.put_slice(b"\r\n");
+        self.header_buf.extend_from_slice(b"\r\n");
 
-            buf.split().freeze()
-        });
-
-        self.writer.write_all(&header_bytes).await?;
+        // Write Header Buffer into Tokio's BufWriter
+        self.writer.write_all(&self.header_buf).await?;
 
         if !response.suppress_body && !status_forbids_body {
             self.write_body(response.body, &response.field_lines)
                 .await?;
         }
 
-        self.writer.flush().await?;
+        // ✨ THE MAGIC PIPELINING OPTIMIZATION ✨
+        // Only flush to the OS if our incoming reader is empty.
+        // If it isn't empty, it means the client stuffed MULTIPLE requests
+        // into the same TCP packet! We skip flushing, loop back, process
+        // the next request immediately, and send ALL responses in a single OS syscall!
+        if self.reader.is_empty() {
+            self.writer.flush().await?;
+        }
 
         if let Some(hook) = response.on_sent {
-            hook(status_code);
+            hook(response.status_code);
         }
 
         Ok(())
@@ -251,7 +290,7 @@ impl Connection {
     }
 
     async fn write_chunk(&mut self, data: &[u8]) -> Result<(), tokio::io::Error> {
-        let mut hex_buf = [0u8; 18]; // max usize hex is 16 chars + \r\n
+        let mut hex_buf = [0u8; 18];
         let hex_str = format_hex(data.len(), &mut hex_buf);
 
         self.writer.write_all(hex_str).await?;
@@ -282,8 +321,7 @@ fn format_hex(n: usize, buf: &mut [u8; 18]) -> &[u8] {
         return &buf[..3];
     }
 
-    // Write hex digits in reverse
-    let mut i = 15usize; // leave room for \r\n at end
+    let mut i = 15usize;
     let mut val = n;
     while val > 0 {
         let digit = (val & 0xF) as u8;
@@ -295,9 +333,8 @@ fn format_hex(n: usize, buf: &mut [u8; 18]) -> &[u8] {
         i -= 1;
         val >>= 4;
     }
-    i += 1; // i now points to first hex digit
+    i += 1;
 
-    // Append \r\n
     let end = 16;
     buf[end] = b'\r';
     buf[end + 1] = b'\n';

@@ -14,12 +14,13 @@ use crate::{HttpMethod, HttpStatusCode};
 use bytes::Bytes;
 use socket2::Socket;
 use std::collections::HashMap;
+use std::net::TcpListener;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpListener;
-use tokio::task::JoinSet;
+use tokio::sync::Notify;
 use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
 
@@ -32,7 +33,6 @@ pub enum HttpServerError {
     #[error("{0}")]
     Tls(#[from] TlsConfigError),
 }
-
 
 pub struct RestartContext {
     pub active_requests: Vec<RequestInfo>,
@@ -61,6 +61,40 @@ impl RestartHandle {
             force,
             pre_hook: Box::new(move |ctx| Box::pin(pre_hook(ctx))),
         });
+    }
+}
+
+// Track how many per-core threads are still alive
+// Decrement when each thread's LocalSet finishes draining
+#[derive(Clone)]
+struct ThreadDrainBarrier {
+    remaining: Arc<AtomicUsize>,
+    notify: Arc<Notify>,
+}
+
+impl ThreadDrainBarrier {
+    fn new(thread_count: usize) -> Self {
+        Self {
+            remaining: Arc::new(AtomicUsize::new(thread_count)),
+            notify: Arc::new(Notify::new()),
+        }
+    }
+
+    fn thread_done(&self) {
+        let prev = self.remaining.fetch_sub(1, Ordering::SeqCst);
+        if prev == 1 {
+            // Last thread finished
+            self.notify.notify_waiters();
+        }
+    }
+
+    async fn wait_all_done(&self) {
+        loop {
+            if self.remaining.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            self.notify.notified().await;
+        }
     }
 }
 
@@ -369,7 +403,8 @@ impl HttpServer {
         let listeners = std::mem::take(&mut self.listeners);
         let server = Arc::new(self);
 
-        let (restart_tx, mut restart_rx) = tokio::sync::mpsc::unbounded_channel::<RestartRequest>();
+        let (restart_tx, mut restart_rx) =
+            tokio::sync::mpsc::unbounded_channel::<RestartRequest>();
         let (result_tx, mut result_rx) =
             tokio::sync::mpsc::unbounded_channel::<Result<RestartRequest, ()>>();
 
@@ -389,205 +424,312 @@ impl HttpServer {
 
             #[cfg(unix)]
             let mut sigterm =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .unwrap();
 
-            // ── Multi-Listener Accept Pool ──────────────────────────────────────────
-            //
-            // One task per SO_REUSEPORT socket (= one per CPU core).
-            // Each task accepts and immediately spawns a free connection task —
-            // NO intermediate channel, NO cross-task wakeup, NO serialisation.
-            //
-            // Hot path per connection: listener.accept() → tokio::spawn()
-            // That's it. The control-plane select below never touches this path.
-            let mut accept_pool: JoinSet<()> = JoinSet::new();
+            // Broadcast channel — signals ALL per-core threads to stop accepting
+            let (stop_accept_tx, _) = tokio::sync::broadcast::channel::<()>(1);
 
-            for listener in listeners {
+            // Barrier — tracks when all per-core threads have fully drained
+            // Decremented after each thread's LocalSet::block_on returns
+            let thread_count = listeners.len();
+            let drain_barrier = ThreadDrainBarrier::new(thread_count);
+
+            // ── Spawn one OS thread per listener (thread-per-core) ──────────────
+            for std_listener in listeners {
                 let server_clone = server.clone();
                 let restart_handle = connection_handle.clone();
+                let mut stop_accept_rx = stop_accept_tx.subscribe();
+                let barrier = drain_barrier.clone();
 
-                accept_pool.spawn(async move {
-                    loop {
-                        match listener.accept().await {
-                            Ok((stream, _)) => {
-                                let srv = server_clone.clone();
-                                let rh = restart_handle.clone();
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
 
-                                // Spawn and forget — the connection task is fully
-                                // independent. Active-request tracking inside
-                                // handle_single_request handles graceful drain.
-                                tokio::spawn(async move {
-                                    let transport = match &srv.tls {
-                                        None => {
-                                            let peer_addr = match stream.peer_addr() {
-                                                Ok(a) => a,
-                                                Err(_) => return, // already closed
-                                            };
-                                            Transport::new(stream, peer_addr)
-                                        }
-                                        Some(acceptor) => {
-                                            match acceptor.accept(stream).await {
-                                                Ok(tls_stream) => {
-                                                    let peer_addr =
-                                                        match tls_stream.get_ref().0.peer_addr() {
-                                                            Ok(a) => a,
-                                                            Err(_) => return,
-                                                        };
-                                                    Transport::new(tls_stream, peer_addr)
+                    let local = tokio::task::LocalSet::new();
+
+                    // block_on drives the LocalSet until ALL spawned local tasks complete.
+                    // When accept_task is aborted, only in-flight handle_connection tasks
+                    // remain — block_on keeps running until they all finish.
+                    local.block_on(&rt, async move {
+                        std_listener.set_nonblocking(true).unwrap();
+                        let listener =
+                            tokio::net::TcpListener::from_std(std_listener).unwrap();
+
+                        let server_for_accept = server_clone.clone();
+
+                        // Hot accept loop — spawned as an independent local task
+                        // so the stop signal can abort it cleanly
+                        let accept_task = tokio::task::spawn_local(async move {
+                            loop {
+                                match listener.accept().await {
+                                    Ok((stream, _)) => {
+                                        let srv = server_for_accept.clone();
+                                        let rh = restart_handle.clone();
+
+                                        tokio::task::spawn_local(async move {
+                                            let transport = match &srv.tls {
+                                                None => {
+                                                    match stream.peer_addr() {
+                                                        Ok(peer_addr) => {
+                                                            Transport::new(stream, peer_addr)
+                                                        }
+                                                        Err(_) => return,
+                                                    }
                                                 }
-                                                Err(_) => return, // TLS handshake failed
-                                            }
-                                        }
-                                    };
+                                                Some(acceptor) => {
+                                                    match acceptor.accept(stream).await {
+                                                        Ok(tls_stream) => {
+                                                            match tls_stream.get_ref().0.peer_addr() {
+                                                                Ok(peer_addr) => {
+                                                                    Transport::new(tls_stream, peer_addr)
+                                                                }
+                                                                Err(_) => return,
+                                                            }
+                                                        }
+                                                        Err(_) => return,
+                                                    }
+                                                }
+                                            };
 
-                                    srv.handle_connection(transport, rh).await;
-                                });
+                                            srv.handle_connection(transport, rh).await;
+                                        });
+                                    }
+                                    Err(_) => {
+                                        // Brief sleep on error to avoid spinning on
+                                        // transient accept failures
+                                        tokio::time::sleep(
+                                            std::time::Duration::from_millis(5)
+                                        ).await;
+                                    }
+                                }
                             }
-                            Err(_) => {
-                                // Brief yield on EMFILE/ENFILE to avoid a busy-loop
-                                // when the process hits its file-descriptor limit.
-                                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                            }
-                        }
-                    }
+                        });
+
+                        // 1. Wait for the shutdown signal (stop accepting new traffic)
+                        let _ = stop_accept_rx.recv().await;
+
+                        // 2. Kill the accept loop
+                        accept_task.abort();
+
+                        // 3. ✨ THE FIX ✨
+                        // We MUST keep this future alive so the LocalSet continues to poll
+                        // the in-flight `handle_connection` tasks.
+                        // By awaiting `wait_for_zero` here, the executor keeps spinning until
+                        // every single connection globally has gracefully finished.
+                        server_clone.active_requests.wait_for_zero().await;
+                    });
+
+                    // block_on has returned — LocalSet fully drained
+                    // Every in-flight handle_connection on this thread has finished
+                    // Signal the barrier so the control plane knows this thread is done
+                    barrier.thread_done();
                 });
             }
 
-            // ── Control Plane ───────────────────────────────────────────────────────
-            //
-            // This select loop is entirely off the hot path. It only wakes on
-            // infrequent events: restart requests, OS signals, child-process results.
-            // Connection throughput is completely unaffected by what happens here.
+            // ── Control plane ────────────────────────────────────────────────────
             let force: bool = loop {
                 tokio::select! {
-                    Some(restart_req) = restart_rx.recv() => {
-                        if restart_in_progress {
+                Some(restart_req) = restart_rx.recv() => {
+                    if restart_in_progress {
+                        println!("Restart already in progress, ignoring duplicate.");
+                        continue;
+                    }
+
+                    restart_in_progress = true;
+                    println!("Restart triggered. Force: {}", restart_req.force);
+
+                    let mut current_exe = match std::env::current_exe() {
+                        Ok(exe) => exe,
+                        Err(e) => {
+                            println!("Failed to get executable path: {}", e);
+                            restart_in_progress = false;
                             continue;
                         }
+                    };
 
-                        restart_in_progress = true;
+                    if !current_exe.exists() {
+                        current_exe =
+                            std::path::PathBuf::from(std::env::args().next().unwrap());
+                    }
 
-                        let mut current_exe = match std::env::current_exe() {
-                            Ok(exe) => exe,
-                            Err(_) => {
+                    let mut child =
+                        match std::process::Command::new(&current_exe)
+                            .args(std::env::args().skip(1))
+                            .spawn()
+                        {
+                            Ok(c) => c,
+                            Err(e) => {
+                                println!("Failed to spawn new process: {}", e);
                                 restart_in_progress = false;
                                 continue;
                             }
                         };
 
-                        if !current_exe.exists() {
-                            current_exe =
-                                std::path::PathBuf::from(std::env::args().next().unwrap());
-                        }
+                    *child_pid.lock().unwrap() = Some(child.id());
 
-                        let mut child =
-                            match std::process::Command::new(&current_exe)
-                                .args(std::env::args().skip(1))
-                                .spawn()
-                            {
-                                Ok(c) => c,
-                                Err(_) => {
-                                    restart_in_progress = false;
-                                    continue;
-                                }
+                    println!(
+                        "New process spawned (PID {}). Verifying stability for {}s...",
+                        child.id(),
+                        server.restart_stability_window.as_secs(),
+                    );
+
+                    let result_tx = result_tx.clone();
+                    let stability_window = server.restart_stability_window;
+
+                    tokio::spawn(async move {
+                        tokio::time::sleep(stability_window).await;
+
+                        match child.try_wait() {
+                            Ok(Some(status)) => {
+                                println!(
+                                    "New instance crashed with status: {}",
+                                    status
+                                );
+                                let _ = result_tx.send(Err(()));
+                            }
+                            Ok(None) => {
+                                println!("New instance appears stable.");
+                                let _ = result_tx.send(Ok(restart_req));
+                            }
+                            Err(e) => {
+                                println!(
+                                    "Failed to check new instance status: {}. Aborting.",
+                                    e
+                                );
+                                let _ = result_tx.send(Err(()));
+                            }
+                        }
+                    });
+                }
+
+                result = result_rx.recv() => {
+                    match result {
+                        Some(Ok(restart_req)) => {
+                            println!(
+                                "New instance stable. Stopping accept loops..."
+                            );
+
+                            // Stop all per-core accept loops — OS routes new
+                            // connections to new process via SO_REUSEPORT
+                            let _ = stop_accept_tx.send(());
+
+                            let ctx = RestartContext {
+                                active_requests: server.active_requests
+                                    .snapshot()
+                                    .into_values()
+                                    .collect(),
                             };
 
-                        *child_pid.lock().unwrap() = Some(child.id());
+                            println!(
+                                "Running pre-hook with {} active requests...",
+                                ctx.active_requests.len()
+                            );
 
-                        let result_tx = result_tx.clone();
-                        let stability_window = server.restart_stability_window;
-
-                        tokio::spawn(async move {
-                            tokio::time::sleep(stability_window).await;
-
-                            match child.try_wait() {
-                                Ok(Some(_)) => { let _ = result_tx.send(Err(())); }
-                                Ok(None)    => { let _ = result_tx.send(Ok(restart_req)); }
-                                Err(_)      => { let _ = result_tx.send(Err(())); }
-                            }
-                        });
-                    }
-
-                    result = result_rx.recv() => {
-                        match result {
-                            Some(Ok(restart_req)) => {
-                                // Stop accepting — SO_REUSEPORT immediately routes
-                                // new connections to the new process. In-flight
-                                // requests continue on the free connection tasks.
-                                accept_pool.abort_all();
-
-                                let ctx = RestartContext {
-                                    active_requests: server.active_requests
-                                        .snapshot()
-                                        .into_values()
-                                        .collect(),
-                                };
-
-                                match tokio::time::timeout(
-                                    server.restart_pre_hook_timeout,
-                                    (restart_req.pre_hook)(ctx),
-                                ).await {
-                                    Ok(_) => {}
-                                    Err(_) => {}
+                            match tokio::time::timeout(
+                                server.restart_pre_hook_timeout,
+                                (restart_req.pre_hook)(ctx),
+                            ).await {
+                                Ok(_) => {
+                                    println!("Pre-hook complete. Handing over.");
                                 }
-
-                                break restart_req.force;
-                            }
-                            Some(Err(_)) | None => {
-                                *child_pid.lock().unwrap() = None;
-                                restart_in_progress = false;
-                            }
-                        }
-                    }
-
-                    _ = tokio::signal::ctrl_c() => {
-                        if restart_in_progress {
-                            if let Some(pid) = *child_pid.lock().unwrap() {
-                                #[cfg(unix)]
-                                unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL); }
-                                #[cfg(not(unix))]
-                                {
-                                    let _ = std::process::Command::new("taskkill")
-                                        .args(["/PID", &pid.to_string(), "/F"])
-                                        .spawn();
+                                Err(_) => {
+                                    println!(
+                                        "Pre-hook timed out after {}s. Proceeding.",
+                                        server.restart_pre_hook_timeout.as_secs()
+                                    );
                                 }
                             }
-                        }
-                        accept_pool.abort_all();
-                        break false;
-                    }
 
-                    _ = async {
-                        #[cfg(unix)]
-                        sigterm.recv().await;
-                        #[cfg(not(unix))]
-                        std::future::pending::<()>().await;
-                    } => {
-                        if restart_in_progress {
-                            if let Some(pid) = *child_pid.lock().unwrap() {
-                                #[cfg(unix)]
-                                unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL); }
-                                #[cfg(not(unix))]
-                                {
-                                    let _ = std::process::Command::new("taskkill")
-                                        .args(["/PID", &pid.to_string(), "/F"])
-                                        .spawn();
-                                }
-                            }
+                            break restart_req.force;
                         }
-                        accept_pool.abort_all();
-                        break false;
+                        Some(Err(_)) => {
+                            println!(
+                                "Restart failed. Unlocking for future attempts."
+                            );
+                            *child_pid.lock().unwrap() = None;
+                            restart_in_progress = false;
+                        }
+                        None => {
+                            println!(
+                                "Result channel closed unexpectedly. Unlocking."
+                            );
+                            *child_pid.lock().unwrap() = None;
+                            restart_in_progress = false;
+                        }
                     }
                 }
+
+                _ = tokio::signal::ctrl_c() => {
+                    if restart_in_progress {
+                        if let Some(pid) = *child_pid.lock().unwrap() {
+                            println!(
+                                "SIGINT during restart. Killing child PID {}.",
+                                pid
+                            );
+                            #[cfg(unix)]
+                            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL); }
+                            #[cfg(not(unix))]
+                            {
+                                let _ = std::process::Command::new("taskkill")
+                                    .args(["/PID", &pid.to_string(), "/F"])
+                                    .spawn();
+                            }
+                        }
+                    }
+                    println!("SIGINT received. Graceful shutdown.");
+                    let _ = stop_accept_tx.send(());
+                    break false;
+                }
+
+                _ = async {
+                    #[cfg(unix)]
+                    sigterm.recv().await;
+                    #[cfg(not(unix))]
+                    std::future::pending::<()>().await;
+                } => {
+                    if restart_in_progress {
+                        if let Some(pid) = *child_pid.lock().unwrap() {
+                            println!(
+                                "SIGTERM during restart. Killing child PID {}.",
+                                pid
+                            );
+                            #[cfg(unix)]
+                            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL); }
+                            #[cfg(not(unix))]
+                            {
+                                let _ = std::process::Command::new("taskkill")
+                                    .args(["/PID", &pid.to_string(), "/F"])
+                                    .spawn();
+                            }
+                        }
+                    }
+                    println!("SIGTERM received. Graceful shutdown.");
+                    let _ = stop_accept_tx.send(());
+                    break false;
+                }
+            }
             };
 
-            // ── Drain & Exit ────────────────────────────────────────────────────────
-            //
-            // force=true  → exit immediately; OS kills every task and connection.
-            // force=false → wait until every active request completes, then exit.
-            //               Idle keep-alive connections are terminated by the OS on
-            //               exit, matching standard graceful-restart semantics.
-            if !force {
+            // ── Drain & Exit ─────────────────────────────────────────────────────
+            if force {
+                println!("Force shutdown. Exiting immediately.");
+            } else {
+                println!("Graceful shutdown. Waiting for active requests...");
+
+                // Wait for all request guards to be dropped —
+                // guarantees handle_single_request has returned on every thread
                 server.active_requests.wait_for_zero().await;
+
+                 println!("All requests complete. Waiting for threads to drain...");
+
+                // Wait for every per-core thread's LocalSet::block_on to return —
+                // guarantees every response has been fully written to the socket
+                drain_barrier.wait_all_done().await;
+
+                 println!("All threads drained. Exiting.");
             }
 
             std::process::exit(0);
@@ -699,22 +841,17 @@ impl HttpServer {
                         info.set_response_status(status_code.clone());
                         info.mark_as_end();
                     });
-                    if let Some(cb) = &on_complete
-                        && let Some(info) = g.value()
-                    {
-                        // Note: you also have a latent bug here — this future is
-                        // created and immediately dropped, never executed.
-                        // It needs tokio::spawn(cb(...)) to actually fire.
-                        tokio::spawn(cb({
-                            let mut i = info.clone();
-                            i.set_response_status(status_code);
-                            i
-                        }));
+                    if let Some(cb) = &on_complete {
+                        if let Some(info) = g.value() {
+                            // FIXED BUG: Execute the hook locally on this exact CPU core!
+                            tokio::task::spawn_local(cb({
+                                let mut i = info.clone();
+                                i.set_response_status(status_code);
+                                i
+                            }));
+                        }
                     }
                 }));
-            } else {
-                // Guard still drops at end of scope — wait_for_zero() works correctly.
-                // We just skip the Arc alloc and the hook dispatch.
             }
         }
 
@@ -943,11 +1080,8 @@ impl HttpServerBuilder {
                 )
                 .unwrap_or(());
 
-            let std_listener: std::net::TcpListener = socket.into();
-            let listener = TcpListener::from_std(std_listener)
-                .map_err(|_| HttpServerError::AddrInUse(self.port))?;
-
-            listeners.push(listener);
+            let std_listener: TcpListener = socket.into();
+            listeners.push(std_listener);
         }
 
         let tls = if let Some(tls_config) = self.tls_config {
