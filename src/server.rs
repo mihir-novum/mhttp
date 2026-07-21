@@ -17,9 +17,9 @@ use std::collections::HashMap;
 use std::net::TcpListener;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::io::AsyncWriteExt;
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
 use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
@@ -110,22 +110,20 @@ pub struct HttpCall {
 
 impl HttpCall {
     async fn parse(
-        transport: Transport,
+        mut connection: Connection,
         request_id: Uuid,
         max_body_size: usize,
         keep_alive_timeout: std::time::Duration,
         request_timeout: std::time::Duration,
         restart_handle: RestartHandle,
-    ) -> Result<Option<Self>, (Transport, HttpRequestError)> {
-        let mut connection = Connection::new(transport);
-
+    ) -> Result<Option<Self>, (Connection, HttpRequestError)> {
         let request = match connection
             .read_request(max_body_size, keep_alive_timeout, request_timeout)
             .await
         {
             Ok(Some(r)) => r,
             Ok(None) => return Ok(None), // Client disconnected cleanly while idle
-            Err(e) => return Err((connection.into_transport(), e)),
+            Err(e) => return Err((connection, e)),
         };
 
         Ok(Some(Self {
@@ -321,6 +319,81 @@ impl HttpCall {
     }
 }
 
+impl HttpCall {
+    /// Efficiently fast-forwards and drops unread bytes from the socket
+    /// to prevent corrupting the next Keep-Alive request.
+    pub(crate) async fn discard_unread_body(&mut self) -> Result<(), std::io::Error> {
+        let state = std::mem::replace(&mut self.request.body_state, BodyState::Reading);
+
+        let (content_length, is_chunked) = match state {
+            BodyState::Unread {
+                content_length,
+                is_chunked,
+            } => (content_length, is_chunked),
+            _ => return Ok(()), // Body was already read by the user, nothing to do!
+        };
+
+        if content_length == 0 && !is_chunked {
+            return Ok(());
+        }
+
+        // Discarding chunked payloads safely requires parsing chunk boundaries.
+        // For security against malformed data, if a user ignores a chunked request,
+        // we simply force the TCP connection to close.
+        if is_chunked {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Unread chunked body forces connection close",
+            ));
+        }
+
+        let mut remaining = content_length;
+
+        while remaining > 0 {
+            let avail = self.connection.reader.len();
+            if avail > 0 {
+                let take = std::cmp::min(remaining, avail);
+                // Zero-copy discard by advancing the internal pointer
+                let _ = self.connection.reader.split_to(take);
+                remaining -= take;
+            }
+
+            if remaining == 0 {
+                break;
+            }
+
+            self.connection.reader.reserve(8192);
+
+            // We use a 5-second timeout to prevent Slowloris attacks where a client
+            // promises a 10MB body but stops sending bytes, hanging our Thread-Per-Core worker.
+            let read_fut = self
+                .connection
+                .writer
+                .get_mut()
+                .read_buf(&mut self.connection.reader);
+
+            let n = match tokio::time::timeout(std::time::Duration::from_secs(5), read_fut).await {
+                Ok(Ok(n)) => n,
+                _ => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "Timeout or EOF while draining unread body",
+                    ));
+                }
+            };
+
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "EOF while draining unread body",
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
 // ── RequestInfo ────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
@@ -403,8 +476,7 @@ impl HttpServer {
         let listeners = std::mem::take(&mut self.listeners);
         let server = Arc::new(self);
 
-        let (restart_tx, mut restart_rx) =
-            tokio::sync::mpsc::unbounded_channel::<RestartRequest>();
+        let (restart_tx, mut restart_rx) = tokio::sync::mpsc::unbounded_channel::<RestartRequest>();
         let (result_tx, mut result_rx) =
             tokio::sync::mpsc::unbounded_channel::<Result<RestartRequest, ()>>();
 
@@ -424,8 +496,7 @@ impl HttpServer {
 
             #[cfg(unix)]
             let mut sigterm =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .unwrap();
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
 
             // Broadcast channel — signals ALL per-core threads to stop accepting
             let (stop_accept_tx, _) = tokio::sync::broadcast::channel::<()>(1);
@@ -455,8 +526,7 @@ impl HttpServer {
                     // remain — block_on keeps running until they all finish.
                     local.block_on(&rt, async move {
                         std_listener.set_nonblocking(true).unwrap();
-                        let listener =
-                            tokio::net::TcpListener::from_std(std_listener).unwrap();
+                        let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
 
                         let server_for_accept = server_clone.clone();
 
@@ -471,21 +541,20 @@ impl HttpServer {
 
                                         tokio::task::spawn_local(async move {
                                             let transport = match &srv.tls {
-                                                None => {
-                                                    match stream.peer_addr() {
-                                                        Ok(peer_addr) => {
-                                                            Transport::new(stream, peer_addr)
-                                                        }
-                                                        Err(_) => return,
+                                                None => match stream.peer_addr() {
+                                                    Ok(peer_addr) => {
+                                                        Transport::new(stream, peer_addr)
                                                     }
-                                                }
+                                                    Err(_) => return,
+                                                },
                                                 Some(acceptor) => {
                                                     match acceptor.accept(stream).await {
                                                         Ok(tls_stream) => {
-                                                            match tls_stream.get_ref().0.peer_addr() {
-                                                                Ok(peer_addr) => {
-                                                                    Transport::new(tls_stream, peer_addr)
-                                                                }
+                                                            match tls_stream.get_ref().0.peer_addr()
+                                                            {
+                                                                Ok(peer_addr) => Transport::new(
+                                                                    tls_stream, peer_addr,
+                                                                ),
                                                                 Err(_) => return,
                                                             }
                                                         }
@@ -500,9 +569,8 @@ impl HttpServer {
                                     Err(_) => {
                                         // Brief sleep on error to avoid spinning on
                                         // transient accept failures
-                                        tokio::time::sleep(
-                                            std::time::Duration::from_millis(5)
-                                        ).await;
+                                        tokio::time::sleep(std::time::Duration::from_millis(5))
+                                            .await;
                                     }
                                 }
                             }
@@ -532,185 +600,185 @@ impl HttpServer {
             // ── Control plane ────────────────────────────────────────────────────
             let force: bool = loop {
                 tokio::select! {
-                Some(restart_req) = restart_rx.recv() => {
-                    if restart_in_progress {
-                        println!("Restart already in progress, ignoring duplicate.");
-                        continue;
-                    }
-
-                    restart_in_progress = true;
-                    println!("Restart triggered. Force: {}", restart_req.force);
-
-                    let mut current_exe = match std::env::current_exe() {
-                        Ok(exe) => exe,
-                        Err(e) => {
-                            println!("Failed to get executable path: {}", e);
-                            restart_in_progress = false;
+                    Some(restart_req) = restart_rx.recv() => {
+                        if restart_in_progress {
+                            println!("Restart already in progress, ignoring duplicate.");
                             continue;
                         }
-                    };
 
-                    if !current_exe.exists() {
-                        current_exe =
-                            std::path::PathBuf::from(std::env::args().next().unwrap());
-                    }
+                        restart_in_progress = true;
+                        println!("Restart triggered. Force: {}", restart_req.force);
 
-                    let mut child =
-                        match std::process::Command::new(&current_exe)
-                            .args(std::env::args().skip(1))
-                            .spawn()
-                        {
-                            Ok(c) => c,
+                        let mut current_exe = match std::env::current_exe() {
+                            Ok(exe) => exe,
                             Err(e) => {
-                                println!("Failed to spawn new process: {}", e);
+                                println!("Failed to get executable path: {}", e);
                                 restart_in_progress = false;
                                 continue;
                             }
                         };
 
-                    *child_pid.lock().unwrap() = Some(child.id());
-
-                    println!(
-                        "New process spawned (PID {}). Verifying stability for {}s...",
-                        child.id(),
-                        server.restart_stability_window.as_secs(),
-                    );
-
-                    let result_tx = result_tx.clone();
-                    let stability_window = server.restart_stability_window;
-
-                    tokio::spawn(async move {
-                        tokio::time::sleep(stability_window).await;
-
-                        match child.try_wait() {
-                            Ok(Some(status)) => {
-                                println!(
-                                    "New instance crashed with status: {}",
-                                    status
-                                );
-                                let _ = result_tx.send(Err(()));
-                            }
-                            Ok(None) => {
-                                println!("New instance appears stable.");
-                                let _ = result_tx.send(Ok(restart_req));
-                            }
-                            Err(e) => {
-                                println!(
-                                    "Failed to check new instance status: {}. Aborting.",
-                                    e
-                                );
-                                let _ = result_tx.send(Err(()));
-                            }
+                        if !current_exe.exists() {
+                            current_exe =
+                                std::path::PathBuf::from(std::env::args().next().unwrap());
                         }
-                    });
-                }
 
-                result = result_rx.recv() => {
-                    match result {
-                        Some(Ok(restart_req)) => {
-                            println!(
-                                "New instance stable. Stopping accept loops..."
-                            );
-
-                            // Stop all per-core accept loops — OS routes new
-                            // connections to new process via SO_REUSEPORT
-                            let _ = stop_accept_tx.send(());
-
-                            let ctx = RestartContext {
-                                active_requests: server.active_requests
-                                    .snapshot()
-                                    .into_values()
-                                    .collect(),
+                        let mut child =
+                            match std::process::Command::new(&current_exe)
+                                .args(std::env::args().skip(1))
+                                .spawn()
+                            {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    println!("Failed to spawn new process: {}", e);
+                                    restart_in_progress = false;
+                                    continue;
+                                }
                             };
 
-                            println!(
-                                "Running pre-hook with {} active requests...",
-                                ctx.active_requests.len()
-                            );
+                        *child_pid.lock().unwrap() = Some(child.id());
 
-                            match tokio::time::timeout(
-                                server.restart_pre_hook_timeout,
-                                (restart_req.pre_hook)(ctx),
-                            ).await {
-                                Ok(_) => {
-                                    println!("Pre-hook complete. Handing over.");
-                                }
-                                Err(_) => {
+                        println!(
+                            "New process spawned (PID {}). Verifying stability for {}s...",
+                            child.id(),
+                            server.restart_stability_window.as_secs(),
+                        );
+
+                        let result_tx = result_tx.clone();
+                        let stability_window = server.restart_stability_window;
+
+                        tokio::spawn(async move {
+                            tokio::time::sleep(stability_window).await;
+
+                            match child.try_wait() {
+                                Ok(Some(status)) => {
                                     println!(
-                                        "Pre-hook timed out after {}s. Proceeding.",
-                                        server.restart_pre_hook_timeout.as_secs()
+                                        "New instance crashed with status: {}",
+                                        status
                                     );
+                                    let _ = result_tx.send(Err(()));
+                                }
+                                Ok(None) => {
+                                    println!("New instance appears stable.");
+                                    let _ = result_tx.send(Ok(restart_req));
+                                }
+                                Err(e) => {
+                                    println!(
+                                        "Failed to check new instance status: {}. Aborting.",
+                                        e
+                                    );
+                                    let _ = result_tx.send(Err(()));
                                 }
                             }
-
-                            break restart_req.force;
-                        }
-                        Some(Err(_)) => {
-                            println!(
-                                "Restart failed. Unlocking for future attempts."
-                            );
-                            *child_pid.lock().unwrap() = None;
-                            restart_in_progress = false;
-                        }
-                        None => {
-                            println!(
-                                "Result channel closed unexpectedly. Unlocking."
-                            );
-                            *child_pid.lock().unwrap() = None;
-                            restart_in_progress = false;
-                        }
+                        });
                     }
-                }
 
-                _ = tokio::signal::ctrl_c() => {
-                    if restart_in_progress {
-                        if let Some(pid) = *child_pid.lock().unwrap() {
-                            println!(
-                                "SIGINT during restart. Killing child PID {}.",
-                                pid
-                            );
-                            #[cfg(unix)]
-                            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL); }
-                            #[cfg(not(unix))]
-                            {
-                                let _ = std::process::Command::new("taskkill")
-                                    .args(["/PID", &pid.to_string(), "/F"])
-                                    .spawn();
+                    result = result_rx.recv() => {
+                        match result {
+                            Some(Ok(restart_req)) => {
+                                println!(
+                                    "New instance stable. Stopping accept loops..."
+                                );
+
+                                // Stop all per-core accept loops — OS routes new
+                                // connections to new process via SO_REUSEPORT
+                                let _ = stop_accept_tx.send(());
+
+                                let ctx = RestartContext {
+                                    active_requests: server.active_requests
+                                        .snapshot()
+                                        .into_values()
+                                        .collect(),
+                                };
+
+                                println!(
+                                    "Running pre-hook with {} active requests...",
+                                    ctx.active_requests.len()
+                                );
+
+                                match tokio::time::timeout(
+                                    server.restart_pre_hook_timeout,
+                                    (restart_req.pre_hook)(ctx),
+                                ).await {
+                                    Ok(_) => {
+                                        println!("Pre-hook complete. Handing over.");
+                                    }
+                                    Err(_) => {
+                                        println!(
+                                            "Pre-hook timed out after {}s. Proceeding.",
+                                            server.restart_pre_hook_timeout.as_secs()
+                                        );
+                                    }
+                                }
+
+                                break restart_req.force;
+                            }
+                            Some(Err(_)) => {
+                                println!(
+                                    "Restart failed. Unlocking for future attempts."
+                                );
+                                *child_pid.lock().unwrap() = None;
+                                restart_in_progress = false;
+                            }
+                            None => {
+                                println!(
+                                    "Result channel closed unexpectedly. Unlocking."
+                                );
+                                *child_pid.lock().unwrap() = None;
+                                restart_in_progress = false;
                             }
                         }
                     }
-                    println!("SIGINT received. Graceful shutdown.");
-                    let _ = stop_accept_tx.send(());
-                    break false;
-                }
 
-                _ = async {
-                    #[cfg(unix)]
-                    sigterm.recv().await;
-                    #[cfg(not(unix))]
-                    std::future::pending::<()>().await;
-                } => {
-                    if restart_in_progress {
-                        if let Some(pid) = *child_pid.lock().unwrap() {
-                            println!(
-                                "SIGTERM during restart. Killing child PID {}.",
-                                pid
-                            );
-                            #[cfg(unix)]
-                            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL); }
-                            #[cfg(not(unix))]
-                            {
-                                let _ = std::process::Command::new("taskkill")
-                                    .args(["/PID", &pid.to_string(), "/F"])
-                                    .spawn();
+                    _ = tokio::signal::ctrl_c() => {
+                        if restart_in_progress {
+                            if let Some(pid) = *child_pid.lock().unwrap() {
+                                println!(
+                                    "SIGINT during restart. Killing child PID {}.",
+                                    pid
+                                );
+                                #[cfg(unix)]
+                                unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL); }
+                                #[cfg(not(unix))]
+                                {
+                                    let _ = std::process::Command::new("taskkill")
+                                        .args(["/PID", &pid.to_string(), "/F"])
+                                        .spawn();
+                                }
                             }
                         }
+                        println!("SIGINT received. Graceful shutdown.");
+                        let _ = stop_accept_tx.send(());
+                        break false;
                     }
-                    println!("SIGTERM received. Graceful shutdown.");
-                    let _ = stop_accept_tx.send(());
-                    break false;
+
+                    _ = async {
+                        #[cfg(unix)]
+                        sigterm.recv().await;
+                        #[cfg(not(unix))]
+                        std::future::pending::<()>().await;
+                    } => {
+                        if restart_in_progress {
+                            if let Some(pid) = *child_pid.lock().unwrap() {
+                                println!(
+                                    "SIGTERM during restart. Killing child PID {}.",
+                                    pid
+                                );
+                                #[cfg(unix)]
+                                unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL); }
+                                #[cfg(not(unix))]
+                                {
+                                    let _ = std::process::Command::new("taskkill")
+                                        .args(["/PID", &pid.to_string(), "/F"])
+                                        .spawn();
+                                }
+                            }
+                        }
+                        println!("SIGTERM received. Graceful shutdown.");
+                        let _ = stop_accept_tx.send(());
+                        break false;
+                    }
                 }
-            }
             };
 
             // ── Drain & Exit ─────────────────────────────────────────────────────
@@ -723,13 +791,13 @@ impl HttpServer {
                 // guarantees handle_single_request has returned on every thread
                 server.active_requests.wait_for_zero().await;
 
-                 println!("All requests complete. Waiting for threads to drain...");
+                println!("All requests complete. Waiting for threads to drain...");
 
                 // Wait for every per-core thread's LocalSet::block_on to return —
                 // guarantees every response has been fully written to the socket
                 drain_barrier.wait_all_done().await;
 
-                 println!("All threads drained. Exiting.");
+                println!("All threads drained. Exiting.");
             }
 
             std::process::exit(0);
@@ -738,15 +806,17 @@ impl HttpServer {
         (handle, fut)
     }
 
-    async fn handle_connection(&self, mut transport: Transport, restart_handle: RestartHandle) {
+    async fn handle_connection(&self, transport: Transport, restart_handle: RestartHandle) {
+        let mut connection = Connection::new(transport);
+
         loop {
             let request_id = Uuid::new_v4();
 
             match self
-                .handle_single_request(transport, request_id, restart_handle.clone())
+                .handle_single_request(connection, request_id, restart_handle.clone())
                 .await
             {
-                Some(returned) => transport = returned,
+                Some(returned) => connection = returned,
                 None => break,
             }
         }
@@ -754,13 +824,13 @@ impl HttpServer {
 
     async fn handle_single_request(
         &self,
-        transport: Transport,
+        connection: Connection,
         request_id: Uuid,
         restart_handle: RestartHandle,
-    ) -> Option<Transport> {
+    ) -> Option<Connection> {
         // ── Parse ──────────────────────────────────────────────────────
         let mut call: HttpCall = match HttpCall::parse(
-            transport,
+            connection,
             request_id,
             self.max_body_size,
             self.keep_alive_timeout,
@@ -774,7 +844,7 @@ impl HttpServer {
                 // Client sat idle for 75s and disconnected gracefully.
                 return None;
             }
-            Err((stream, err)) => {
+            Err((mut stream, err)) => {
                 // Parse failed (Bad Request, Payload Too Large, Slowloris)
                 let status = match err {
                     HttpRequestError::PayloadTooLarge => HttpStatusCode::ContentTooLarge,
@@ -785,10 +855,10 @@ impl HttpServer {
                     HttpRequestError::Timeout => HttpStatusCode::RequestTimeout,
                     _ => HttpStatusCode::BadRequest,
                 };
-                let mut conn = Connection::new(stream);
-                conn.set_keep_alive(false, 0);
 
-                let _ = conn
+                stream.set_keep_alive(false, 0);
+
+                let _ = stream
                     .write_response(
                         HttpResponse::new(
                             Bytes::from_static(b"HTTP/1.1"),
@@ -799,7 +869,7 @@ impl HttpServer {
                         .empty(),
                     )
                     .await;
-                let _ = conn.shutdown().await;
+                let _ = stream.shutdown().await;
                 return None;
             }
         };
@@ -817,7 +887,7 @@ impl HttpServer {
         if let Some(cors) = &self.cors {
             if *call.method() == HttpMethod::OPTIONS {
                 cors.handle_preflight(&mut call).await;
-                return self.finish(call.connection, keep_alive).await;
+                return self.finish(call, keep_alive).await;
             }
         }
 
@@ -912,7 +982,7 @@ impl HttpServer {
                 }
 
                 let _ = call.connection.write_response(resp.empty()).await;
-                return self.finish(call.connection, keep_alive).await;
+                return self.finish(call, keep_alive).await;
             }
         };
 
@@ -926,14 +996,14 @@ impl HttpServer {
         for middleware in matched.route.middleware.iter() {
             middleware(&mut call).await;
             if call.response_sent() {
-                return self.finish(call.connection, keep_alive).await;
+                return self.finish(call, keep_alive).await;
             }
         }
 
         // ── Handler ────────────────────────────────────────────────────
         (matched.route.handler)(&mut call).await;
 
-        self.finish(call.connection, keep_alive).await
+        self.finish(call, keep_alive).await
     }
 
     /// Apply CORS headers to an uninit response for non-OPTIONS requests.
@@ -948,12 +1018,21 @@ impl HttpServer {
         }
     }
 
-    /// Return transport for keep-alive or shut down cleanly.
-    async fn finish(&self, mut connection: Connection, keep_alive: bool) -> Option<Transport> {
+    /// Return connection for keep-alive or shut down cleanly.
+    async fn finish(&self, mut call: HttpCall, mut keep_alive: bool) -> Option<Connection> {
+        // ✨ THE FIX: Automatically clean up lingering network bytes
         if keep_alive {
-            Some(connection.into_transport())
+            if call.discard_unread_body().await.is_err() {
+                // If we couldn't safely drain the body (e.g. timeout or chunked),
+                // we revoke the keep-alive status to forcefully close the corrupted socket.
+                keep_alive = false;
+            }
+        }
+
+        if keep_alive {
+            Some(call.connection)
         } else {
-            let _ = connection.shutdown().await;
+            let _ = call.connection.shutdown().await;
             None
         }
     }

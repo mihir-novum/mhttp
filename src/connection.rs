@@ -89,6 +89,8 @@ impl Connection {
         keep_alive_timeout: std::time::Duration,
         request_timeout: std::time::Duration,
     ) -> Result<Option<HttpRequest>, HttpRequestError> {
+        self.has_written_response = false;
+
         let peer_addr = self.writer.get_ref().peer_addr();
 
         // ── STAGE 1: Idle Timeout ──
