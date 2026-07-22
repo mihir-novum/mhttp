@@ -95,6 +95,10 @@ impl Connection {
 
         // ── STAGE 1: Idle Timeout ──
         if self.reader.is_empty() {
+            if let Err(e) = self.writer.flush().await {
+                return Err(HttpRequestError::Io(e));
+            }
+            
             if self.reader.capacity() < 4096 {
                 self.reader.reserve(8192);
             }

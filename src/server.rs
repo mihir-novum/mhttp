@@ -364,6 +364,13 @@ impl HttpCall {
 
             self.connection.reader.reserve(8192);
 
+            if let Err(_) = self.connection.writer.flush().await {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "Failed to flush response before draining body",
+                ));
+            }
+
             // We use a 5-second timeout to prevent Slowloris attacks where a client
             // promises a 10MB body but stops sending bytes, hanging our Thread-Per-Core worker.
             let read_fut = self
