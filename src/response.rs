@@ -1,9 +1,9 @@
-use crate::CookieOptions;
 use crate::body::Body;
 use crate::compress::Compress;
 use crate::connection::Connection;
 use crate::cookie_store::CookieStore;
 use crate::field_lines::FieldLines;
+use crate::CookieOptions;
 use bytes::Bytes;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, BufReader};
@@ -195,6 +195,14 @@ impl HttpResponse<HttpResponseBodyUnInitialized> {
     ) -> HttpResponse<HttpResponseBodyInitialized> {
         let content_type = content_type.into();
         self.field_lines.set("content-type", content_type.clone());
+
+        if content_len == 0 {
+            self.field_lines.set("transfer-encoding", "chunked");
+        } else {
+            self.field_lines
+                .set("content-length", content_len.to_string());
+        }
+
         self.field_lines
             .set("content-length", content_len.to_string());
         self.into_initialized(Some(Body::from_stream(
